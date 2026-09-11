@@ -1,0 +1,24 @@
+{
+  "name": "Capdio",
+  "version": "1.0.0",
+  "description": "Capdio is for transcribe and play local audio/video files with interactive captions",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "vite"
+  },
+  "keywords": [],
+  "author": "Jesse Shen",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.1",
+    "electron": "^44.3.0",
+    "vite": "^8.2.2"
+  },
+  "dependencies": {
+    "lucide-react": "^1.45.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  }
+}
