@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Capdio upload</title>
+  <style>
+    body { margin: 0; padding: 32px; background: #111827; color: #eef2ff; font: 16px system-ui; }
+    main { max-width: 460px; margin: auto; }
+    input, button { box-sizing: border-box; width: 100%; margin: 12px 0; padding: 13px; border: 1px solid #42506a; border-radius: 10px; color: inherit; background: #1d2939; font: inherit; }
+    button { border: 0; background: #6969ed; font-weight: 700; }
+    button:disabled { opacity: .55; } button[hidden] { display: none; } #cancel { background: #7f3140; }
+    progress { width: 100%; height: 10px; } #status, #queue { color: #aebbd0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Send media to Capdio</h1>
+    <p id="status">Choose audio or video files.</p>
+    <input id="files" type="file" multiple accept="audio/*,video/*">
+    <button id="send" disabled>Upload selected files</button>
+    <button id="cancel" hidden>Cancel upload</button>
+    <progress id="progress" value="0" max="100"></progress>
+    <p id="queue">0 / 0 uploaded</p>
+  </main>
+  <script>
+    const filesInput = document.querySelector('#files');
+    const status = document.querySelector('#status');
+    const progress = document.querySelector('#progress');
+    const send = document.querySelector('#send');
+    const cancel = document.querySelector('#cancel');
+    const queue = document.querySelector('#queue');
+    let request; let files = []; let index = 0; let uploaded = 0; let cancelled = false;
+    function reset(message) { filesInput.disabled = false; filesInput.value = ''; files = []; index = 0; uploaded = 0; progress.value = 0; send.disabled = true; send.textContent = 'Upload selected files'; cancel.hidden = true; status.textContent = message; queue.textContent = '0 / 0 uploaded'; }
+    filesInput.onchange = () => { files = [...filesInput.files]; index = 0; uploaded = 0; send.disabled = !files.length; status.textContent = files.length ? `${files.length} file${files.length === 1 ? '' : 's'} selected.` : 'Choose audio or video files.'; queue.textContent = `0 / ${files.length} uploaded`; };
+    function uploadNext() { if (cancelled) return reset('Upload cancelled.'); if (index >= files.length) return reset('All files imported.'); const file = files[index]; const data = new FormData(); data.append('media', file, file.name); filesInput.disabled = true; send.disabled = true; send.textContent = 'Uploading…'; cancel.hidden = false; status.textContent = `Uploading: ${file.name}`; queue.textContent = `${uploaded} / ${files.length} uploaded`; progress.value = 0; request = new XMLHttpRequest(); request.upload.onprogress = (event) => { if (event.lengthComputable) progress.value = event.loaded / event.total * 100; }; request.onload = () => { if (request.status >= 200 && request.status < 300) { uploaded++; index++; uploadNext(); } else reset(`Upload failed: ${request.responseText}`); }; request.onerror = () => reset(cancelled ? 'Upload cancelled.' : 'Upload interrupted.'); request.onabort = () => reset('Upload cancelled.'); request.open('POST', '/upload/upload'); request.send(data); }
+    send.onclick = () => { if (!files.length) return; cancelled = false; uploadNext(); };
+    cancel.onclick = () => { cancelled = true; request?.abort(); };
+  </script>
+</body>
+</html>

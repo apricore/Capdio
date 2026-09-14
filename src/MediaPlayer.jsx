@@ -23,6 +23,12 @@ function secondsToTimestamp(value) {
  */
 export default function MediaPlayer({
   src,
+  mediaId,
+  initialPosition = 0,
+  autoplay = false,
+  onPlayingChange,
+  onCurrentPosition,
+  onPositionChange,
   captions = EMPTY_CAPTIONS,
   className = '',
   dark = false,
@@ -41,6 +47,11 @@ export default function MediaPlayer({
   const playerRef = useRef(null);
   const mediaRef = useRef(null);
   const activeRef = useRef(null);
+  const positionRef = useRef(0);
+  const hasLoadedSourceRef = useRef(false);
+  const hasRestoredPositionRef = useRef(false);
+  const onPositionChangeRef = useRef(onPositionChange);
+  onPositionChangeRef.current = onPositionChange;
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -73,6 +84,8 @@ export default function MediaPlayer({
   useEffect(() => {
     const media = mediaRef.current;
     if (!media) return;
+    hasLoadedSourceRef.current = false;
+    hasRestoredPositionRef.current = false;
     media.pause();
     setCurrentTime(0);
     setDuration(0);
@@ -80,6 +93,10 @@ export default function MediaPlayer({
     setActiveIndex(-1);
     media.load();
   }, [src]);
+
+  useEffect(() => () => {
+    if (hasLoadedSourceRef.current) onPositionChangeRef.current?.(mediaId, positionRef.current);
+  }, [src, mediaId]);
 
   useEffect(() => {
     if (mediaRef.current) mediaRef.current.volume = volume;
@@ -103,6 +120,8 @@ export default function MediaPlayer({
     if (!media) return;
     const time = media.currentTime;
     setCurrentTime(time);
+    positionRef.current = time;
+    onCurrentPosition?.(time);
     const repeatingEntry = entries[activeIndex];
     if (repeatSegment && repeatingEntry && time >= repeatingEntry.end - 0.03) {
       media.currentTime = repeatingEntry.start;
@@ -126,6 +145,7 @@ export default function MediaPlayer({
     if (!media) return;
     const next = Math.min(Math.max(0, time), Number.isFinite(media.duration) ? media.duration : duration);
     media.currentTime = next;
+    positionRef.current = next;
     setCurrentTime(next);
     setActiveIndex(activeAt(next));
   }
@@ -136,6 +156,31 @@ export default function MediaPlayer({
     setActiveIndex(index);
     seek(entry.start);
     if (autoplay) play();
+  }
+
+  function handleLoadedMetadata(event) {
+    const media = event.currentTarget;
+    hasLoadedSourceRef.current = true;
+    setDuration(media.duration);
+    const target = Math.min(Math.max(0, initialPosition), media.duration || 0);
+    const beginPlayback = () => { if (autoplay) media.play().catch(() => {}); };
+    if (target > 0.01) {
+      hasRestoredPositionRef.current = true;
+      media.addEventListener('seeked', beginPlayback, { once: true });
+      media.currentTime = target;
+      positionRef.current = target;
+    } else beginPlayback();
+  }
+
+  function handleCanPlay(event) {
+    if (hasRestoredPositionRef.current) return;
+    const media = event.currentTarget;
+    const target = Math.min(Math.max(0, initialPosition), media.duration || 0);
+    if (target > 0.01 && Math.abs(media.currentTime - target) > 0.1) {
+      hasRestoredPositionRef.current = true;
+      media.currentTime = target;
+      positionRef.current = target;
+    }
   }
 
   function handleCaptionClick(event, index) {
@@ -199,7 +244,7 @@ export default function MediaPlayer({
 
   return (
     <section ref={playerRef} style={{ '--media-player-normal-split': `${normalSplit}%`, '--media-player-fullscreen-split': `${fullscreenSplit}%` }} className={`media-player ${!showMedia ? 'media-player--audio' : ''} ${dark ? 'media-player--dark' : ''} ${className}`} tabIndex="0" onKeyDown={handleKeys}>
-      {showMedia ? <video className="media-player__media" ref={mediaRef} src={src} onTimeUpdate={updateTime} onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} /> : <audio ref={mediaRef} src={src} onTimeUpdate={updateTime} onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} />}
+      {showMedia ? <video className="media-player__media" ref={mediaRef} src={src} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { setIsPlaying(false); onPlayingChange?.(false); }} /> : <audio ref={mediaRef} src={src} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { setIsPlaying(false); onPlayingChange?.(false); }} />}
 
       {showMedia && <div className="media-player__resize-handle" role="separator" aria-label="Resize video and captions" aria-orientation={isFullscreen ? 'vertical' : 'horizontal'} onPointerDown={beginResize} />}
 
