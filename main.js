@@ -1,16 +1,50 @@
-const { app, BrowserWindow, clipboard, ipcMain, dialog, Menu, globalShortcut } = require('electron');
+const { app, BrowserWindow, clipboard, ipcMain, dialog, Menu, globalShortcut, protocol } = require('electron');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const fsSync = require('node:fs');
 const fs = require('node:fs/promises');
+const { Readable } = require('node:stream');
 const crypto = require('node:crypto');
 
-const libraryRoot = path.join(__dirname, 'library');
+// Register before the app is ready so Chromium treats capdio as a first-class,
+// secure URL scheme. This is required for media elements to issue range requests.
+protocol.registerSchemesAsPrivileged([{
+    scheme: 'capdio',
+    privileges: {
+        standard: true,
+        secure: true,
+        stream: true,
+        supportFetchAPI: true,
+        corsEnabled: true
+    }
+}]);
+
+const runtimeRoot = app.isPackaged ? process.resourcesPath : __dirname;
+const platformBinaryDirectory = path.join(runtimeRoot, 'bin', `${process.platform}-${process.arch}`);
+const ffmpegExecutable = app.isPackaged
+    ? path.join(platformBinaryDirectory, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
+    : 'ffmpeg';
+const transcriberExecutable = app.isPackaged
+    ? path.join(platformBinaryDirectory, 'capdio-transcribe', process.platform === 'win32' ? 'capdio-transcribe.exe' : 'capdio-transcribe')
+    : 'python';
+const whisperModelDirectory = app.isPackaged ? path.join(runtimeRoot, 'models') : null;
+const libraryRoot = app.isPackaged ? path.join(app.getPath('userData'), 'library') : path.join(__dirname, 'library');
 const mediaDirectory = path.join(libraryRoot, 'media');
 const captionDirectory = path.join(libraryRoot, 'caption');
 const manifestPath = path.join(libraryRoot, 'manifest.json');
 
 function mediaType(filePath) {
     return ['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'].includes(path.extname(filePath).toLowerCase()) ? 'audio' : 'video';
+}
+
+function mediaMimeType(filePath) {
+    const types = {
+        '.aac': 'audio/aac', '.flac': 'audio/flac', '.m4a': 'audio/mp4',
+        '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.wav': 'audio/wav',
+        '.mkv': 'video/x-matroska', '.mov': 'video/quicktime', '.mp4': 'video/mp4',
+        '.mpeg': 'video/mpeg', '.mpg': 'video/mpeg', '.webm': 'video/webm'
+    };
+    return types[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
 }
 
 async function readManifest() {
@@ -65,6 +99,7 @@ function createWindow() {
         width: 1000,
         height: 700,
         frame: false,
+        backgroundColor: '#111827',
         icon: path.join(__dirname, 'assets', 'capdio-icon.png'),
 
         webPreferences: {
@@ -73,7 +108,11 @@ function createWindow() {
         }
     });
 
-    win.loadURL('http://localhost:5173');
+    if (app.isPackaged) {
+        win.loadFile(path.join(__dirname, 'dist', 'index.html'));
+    } else {
+        win.loadURL('http://localhost:5173');
+    }
 }
 
 ipcMain.handle('window-minimize', (event) => {
@@ -154,7 +193,7 @@ ipcMain.handle('get-library', async () => {
             ...item,
             type: item.type || mediaType(item.media),
             absolutePath: path.resolve(libraryRoot, item.media),
-            playbackPath: path.posix.join('library', item.media),
+            playbackPath: `capdio://library/${item.media.split('/').map(encodeURIComponent).join('/')}`,
             captions
         };
     }));
@@ -279,7 +318,11 @@ ipcMain.handle('import-media', async (event, sourceFile, groupId = null) => {
     };
     manifest.media.push(item);
     await writeManifest(manifest);
-    return { ...item, absolutePath: destination, playbackPath: path.posix.join('library', item.media) };
+    return {
+        ...item,
+        absolutePath: destination,
+        playbackPath: `capdio://library/${item.media.split('/').map(encodeURIComponent).join('/')}`
+    };
 });
 
 ipcMain.handle('set-media-volume', async (event, mediaId, value) => {
@@ -339,7 +382,7 @@ ipcMain.handle('extract-audio', async (event, inputFile) => {
         console.log('FFmpeg input:', inputFile);
         console.log('FFmpeg output:', outputFile);
 
-        const ffmpeg = spawn('ffmpeg', [
+        const ffmpeg = spawn(ffmpegExecutable, [
             '-y',
             '-i', inputFile,
             '-vn',
@@ -417,19 +460,33 @@ ipcMain.handle('run-python-test', async () => {
 let currentTranscriptionProcess = null;
 let transcriptionCancelled = false;
 
-ipcMain.handle('transcribe', async (event, audioFile) => {
+ipcMain.handle('transcribe', async (event, mediaId) => {
+    const manifest = await readManifest();
+    const item = manifest.media.find((entry) => entry.id === mediaId);
+    if (!item) throw new Error('The imported media entry was not found in manifest.json.');
+
+    const audioFile = path.resolve(libraryRoot, item.media);
+    const relativePath = path.relative(mediaDirectory, audioFile);
+    if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+        throw new Error('The media entry points outside the Capdio media library.');
+    }
+
     return new Promise((resolve, reject) => {
         transcriptionCancelled = false;
-        const pythonScript = path.join(
-            __dirname,
-            'python',
-            'transcribe.py'
-        );
-
-        const python = spawn('python', [
-            pythonScript,
-            audioFile
-        ]);
+        const transcriptionArguments = app.isPackaged
+            ? [audioFile]
+            : [path.join(__dirname, 'python', 'transcribe.py'), audioFile];
+        const python = spawn(transcriberExecutable, transcriptionArguments, {
+            env: {
+                ...process.env,
+                // Whisper launches `ffmpeg` itself. Make the bundled executable
+                // discoverable on machines that do not have FFmpeg installed.
+                ...(app.isPackaged ? {
+                    PATH: [platformBinaryDirectory, process.env.PATH].filter(Boolean).join(path.delimiter)
+                } : {}),
+                ...(whisperModelDirectory ? { CAPDIO_WHISPER_MODEL_DIR: whisperModelDirectory } : {})
+            }
+        });
 
         currentTranscriptionProcess = python;
 
@@ -541,11 +598,68 @@ ipcMain.handle('copy-text', (event, value) => {
     clipboard.writeText(String(value || ''));
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+    protocol.handle('capdio', async (request) => {
+        const url = new URL(request.url);
+        if (url.hostname !== 'library') {
+            return new Response('Not found', { status: 404 });
+        }
+        const relativePath = decodeURIComponent(url.pathname).replace(/^\/+/, '');
+        const filePath = path.resolve(libraryRoot, relativePath);
+        const mediaRelativePath = path.relative(mediaDirectory, filePath);
+        if (mediaRelativePath.startsWith('..') || path.isAbsolute(mediaRelativePath)) {
+            return new Response('Forbidden', { status: 403 });
+        }
+        let stat;
+        try {
+            stat = await fs.stat(filePath);
+        } catch {
+            return new Response('Not found', { status: 404 });
+        }
+        if (!stat.isFile()) return new Response('Not found', { status: 404 });
+
+        const size = stat.size;
+        const range = request.headers.get('range');
+        let start = 0;
+        let end = Math.max(0, size - 1);
+        let status = 200;
+
+        if (range) {
+            const match = /^bytes=(\d*)-(\d*)$/i.exec(range.trim());
+            if (!match) {
+                return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${size}` } });
+            }
+            if (match[1] === '') {
+                const requestedLength = Number(match[2]);
+                start = Math.max(0, size - requestedLength);
+            } else {
+                start = Number(match[1]);
+                end = match[2] === '' ? end : Math.min(Number(match[2]), end);
+            }
+            if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start >= size || end < start) {
+                return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${size}` } });
+            }
+            status = 206;
+        }
+
+        const length = end - start + 1;
+        const headers = {
+            'Accept-Ranges': 'bytes',
+            'Content-Length': String(length),
+            'Content-Type': mediaMimeType(filePath)
+        };
+        if (status === 206) headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
+        const body = request.method === 'HEAD' ? null : Readable.toWeb(fsSync.createReadStream(filePath, { start, end }));
+        return new Response(body, { status, headers });
+    });
     Menu.setApplicationMenu(null);
     globalShortcut.register('CommandOrControl+Shift+I', () => {
         BrowserWindow.getFocusedWindow()?.webContents.toggleDevTools();
     });
+    await Promise.all([
+        fs.mkdir(mediaDirectory, { recursive: true }),
+        fs.mkdir(captionDirectory, { recursive: true })
+    ]);
     createWindow();
 });
 

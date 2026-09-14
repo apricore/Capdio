@@ -107,7 +107,6 @@ function App() {
     });
     setMedia(item);
     setCaptions(item.captions || []);
-    setProgress(0);
     setStatus(`Selected ${item.name}.`);
   }
 
@@ -170,7 +169,9 @@ function App() {
     setProgress(0);
     setStatus('Preparing transcription...');
     try {
-      const result = await ipcRenderer.invoke('transcribe', item.absolutePath);
+      // The main process resolves the manifest entry to its on-disk path. Keep
+      // the renderer-only capdio:// playback URL out of the transcription flow.
+      const result = await ipcRenderer.invoke('transcribe', item.id);
       if (result.cancelled) {
         setStatus('Transcription cancelled.');
         return;

@@ -1,6 +1,7 @@
 import sys
 import json
 import importlib
+import os
 
 import whisper
 
@@ -43,7 +44,10 @@ def main():
         flush=True
     )
 
-    model = whisper.load_model("base")
+    model = whisper.load_model(
+        os.environ.get("CAPDIO_WHISPER_MODEL", "base"),
+        download_root=os.environ.get("CAPDIO_WHISPER_MODEL_DIR") or None
+    )
 
     print(
         "STATUS:Transcribing...",
@@ -58,7 +62,8 @@ def main():
     try:
         result = model.transcribe(
             audio_file,
-            verbose=False
+            verbose=False,
+            language="en"
         )
     finally:
         whisper_transcribe.tqdm.tqdm = original_tqdm
