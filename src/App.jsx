@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, Folder, FolderOpen, Minus, Moon, Music, Square, Sun, Video, X } from 'lucide-react';
+import { Check, Copy, Folder, FolderOpen, Minus, Moon, Music, Square, Sun, Video, X } from 'lucide-react';
 import MediaPlayer from './MediaPlayer';
 import capdioIcon from '../assets/capdio-icon.png';
 
@@ -13,6 +13,9 @@ function App() {
   const [appMenu, setAppMenu] = useState(null);
   const [nameDialog, setNameDialog] = useState(null);
   const [deleteDialog, setDeleteDialog] = useState(null);
+  const [uploadSession, setUploadSession] = useState(null);
+  const [uploads, setUploads] = useState([]);
+  const [uploadQueueSize, setUploadQueueSize] = useState(0);
   const [inlineRename, setInlineRename] = useState(null);
   const [expandedGroups, setExpandedGroups] = useState(new Set());
   const [dragTargetGroup, setDragTargetGroup] = useState(null);
@@ -24,15 +27,33 @@ function App() {
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcribingMediaId, setTranscribingMediaId] = useState(null);
   const [queuedTranscriptionIds, setQueuedTranscriptionIds] = useState(new Set());
-  const [darkTheme, setDarkTheme] = useState(() => localStorage.getItem('capdio-theme') === 'dark');
+  const [darkTheme, setDarkTheme] = useState(() => localStorage.getItem('capdio-theme') !== 'light');
   const [sideNavWidth, setSideNavWidth] = useState(() => Number(localStorage.getItem('capdio-side-nav-width')) || 282);
   const [playerFullscreenRequest, setPlayerFullscreenRequest] = useState(0);
   const [videoFullscreenRequest, setVideoFullscreenRequest] = useState(0);
+  const [mediaWasPlaying, setMediaWasPlaying] = useState(false);
+  const [autoplayNext, setAutoplayNext] = useState(false);
   const libraryRef = useRef([]);
   const transcriptionQueueRef = useRef([]);
   const isQueueRunningRef = useRef(false);
   const activeTranscriptionRef = useRef(null);
   const volumeSaveTimerRef = useRef(null);
+  const positionSaveTimersRef = useRef(new Map());
+  const currentPositionRef = useRef(0);
+  const activeMediaRef = useRef(null);
+
+  useEffect(() => { activeMediaRef.current = media; }, [media]);
+
+  useEffect(() => {
+    const saveBeforeClose = () => {
+      const active = activeMediaRef.current;
+      if (!active) return ipcRenderer.invoke('window-close');
+      ipcRenderer.invoke('set-media-position', active.id, currentPositionRef.current)
+        .finally(() => ipcRenderer.invoke('window-close'));
+    };
+    ipcRenderer.on('save-before-close', saveBeforeClose);
+    return () => ipcRenderer.removeListener('save-before-close', saveBeforeClose);
+  }, []);
 
   useEffect(() => {
     libraryRef.current = library;
@@ -45,6 +66,29 @@ function App() {
   useEffect(() => {
     localStorage.setItem('capdio-side-nav-width', String(sideNavWidth));
   }, [sideNavWidth]);
+
+  useEffect(() => {
+    const cancelButton = document.querySelector('.upload-dialog__cancel');
+    if (!cancelButton) return;
+    const canCancel = uploadQueueSize > 0 || uploads.some((upload) => upload.state === 'uploading' || upload.state === 'importing');
+    cancelButton.disabled = !canCancel;
+    cancelButton.textContent = 'Cancel uploads';
+  }, [uploadSession, uploads, uploadQueueSize]);
+
+  useEffect(() => {
+    if (!uploadSession) return undefined;
+    const urlElement = document.querySelector('.upload-dialog code');
+    if (!urlElement) return undefined;
+    const button = document.createElement('button');
+    button.className = 'upload-dialog__copy';
+    button.type = 'button';
+    button.title = 'Copy upload URL';
+    button.setAttribute('aria-label', 'Copy upload URL');
+    button.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+    button.onclick = () => ipcRenderer.invoke('copy-text', uploadSession.url);
+    urlElement.insertAdjacentElement('afterend', button);
+    return () => button.remove();
+  }, [uploadSession]);
 
   useEffect(() => {
     const handleWindowShortcuts = (event) => {
@@ -105,7 +149,13 @@ function App() {
       next.has(item.id) ? next.delete(item.id) : next.add(item.id);
       return next;
     });
+    if (media && media.id !== item.id) {
+      saveMediaPosition(media.id, currentPositionRef.current, true);
+    }
+    setAutoplayNext(mediaWasPlaying);
     setMedia(item);
+    currentPositionRef.current = item.seekPosition ?? 0;
+    localStorage.setItem('capdio-active-media-id', item.id);
     setCaptions(item.captions || []);
     setStatus(`Selected ${item.name}.`);
   }
@@ -115,7 +165,13 @@ function App() {
       const result = await ipcRenderer.invoke('get-library');
       setGroups(result.groups);
       setLibrary(result.media);
-      if (selectFirst && result.media.length) selectMedia(result.media[0]);
+      if (selectFirst && result.media.length) {
+        const savedId = localStorage.getItem('capdio-active-media-id');
+        const initial = result.media.find((item) => item.id === savedId) || result.media[0];
+        selectMedia(initial);
+        if (initial.groupId) setExpandedGroups((groups) => new Set([...groups, initial.groupId]));
+        requestAnimationFrame(() => document.querySelector('.side-nav__item.is-selected')?.scrollIntoView({ block: 'nearest' }));
+      }
       if (!result.media.length) setStatus('Select a local audio or video file to begin.');
     } catch (error) {
       setStatus(`Could not load manifest.json: ${error.message}`);
@@ -126,13 +182,54 @@ function App() {
     loadLibrary(true);
     const onProgress = (_event, value) => setProgress(Math.round(value * 100));
     const onStatus = (_event, message) => setStatus(message);
+    const onUploadStatus = (_event, update) => {
+      if (Number.isFinite(update.queued)) setUploadQueueSize(update.queued);
+      setUploads((uploads) => {
+        const existing = uploads.findIndex((upload) => upload.id === update.id);
+        const next = existing < 0 ? [...uploads, update] : uploads.map((upload, index) => index === existing ? { ...upload, ...update } : upload);
+        return next.slice(-12);
+      });
+      if (update.state === 'complete' && update.item) setLibrary((items) => [...items, { ...update.item, captions: [] }]);
+    };
     ipcRenderer.on('transcription-progress', onProgress);
     ipcRenderer.on('transcription-status', onStatus);
+    ipcRenderer.on('upload-status', onUploadStatus);
     return () => {
       ipcRenderer.removeListener('transcription-progress', onProgress);
       ipcRenderer.removeListener('transcription-status', onStatus);
+      ipcRenderer.removeListener('upload-status', onUploadStatus);
     };
   }, []);
+
+  async function openUpload() {
+    try {
+      const session = await ipcRenderer.invoke('start-upload');
+      setUploadSession(session);
+      setUploads([]);
+      setUploadQueueSize(0);
+    } catch (error) {
+      setStatus(`Could not start upload: ${error.message}`);
+    }
+  }
+
+  function saveMediaPosition(mediaId, value, immediately = false) {
+    if (!mediaId) return;
+    const seekPosition = Math.max(0, Number(value) || 0);
+    setLibrary((items) => items.map((item) => item.id === mediaId ? { ...item, seekPosition } : item));
+    setMedia((current) => current?.id === mediaId ? { ...current, seekPosition } : current);
+    const previousTimer = positionSaveTimersRef.current.get(mediaId);
+    if (previousTimer) clearTimeout(previousTimer);
+    const persist = () => {
+      positionSaveTimersRef.current.delete(mediaId);
+      ipcRenderer.invoke('set-media-position', mediaId, seekPosition).catch(() => {});
+    };
+    if (immediately) persist();
+    else positionSaveTimersRef.current.set(mediaId, setTimeout(persist, 700));
+  }
+
+  async function cancelUploads() {
+    await ipcRenderer.invoke('cancel-uploads');
+  }
 
   async function chooseMedia(groupId = null) {
     setIsImporting(true);
@@ -278,7 +375,11 @@ function App() {
   }
 
   function controlWindow(action) {
-    ipcRenderer.invoke(`window-${action}`);
+    if (action !== 'close') return ipcRenderer.invoke(`window-${action}`);
+    const position = currentPositionRef.current;
+    const activeId = media?.id;
+    Promise.resolve(activeId ? ipcRenderer.invoke('set-media-position', activeId, position) : null)
+      .finally(() => ipcRenderer.invoke('window-close'));
   }
 
   function createGroup() {
@@ -437,7 +538,7 @@ function App() {
         <nav className="app-menu__items" aria-label="Main menu" onClick={(event) => event.stopPropagation()}>
           <div className="app-menu__dropdown">
             <button type="button" onClick={() => setAppMenu((value) => value === 'file' ? null : 'file')}>File</button>
-            {appMenu === 'file' && <div className="app-menu__popup"><button type="button" disabled={isImporting} onClick={() => { chooseMedia(); setAppMenu(null); }}>Import media <kbd>Ctrl+O</kbd></button></div>}
+            {appMenu === 'file' && <div className="app-menu__popup"><button type="button" disabled={isImporting} onClick={() => { chooseMedia(); setAppMenu(null); }}>Import media <kbd>Ctrl+O</kbd></button><button type="button" onClick={() => { openUpload(); setAppMenu(null); }}>Import from phone</button></div>}
           </div>
           <div className="app-menu__dropdown">
             <button type="button" onClick={() => setAppMenu((value) => value === 'view' ? null : 'view')}>View</button>
@@ -477,7 +578,7 @@ function App() {
       <div className="side-nav__resize-handle" role="separator" aria-label="Resize media library" aria-orientation="vertical" onPointerDown={beginSideNavResize} />
 
       <section className="workspace">
-        {media && <MediaPlayer src={media.playbackPath || `library/${media.media}`} captions={captions} hasCaptions={Boolean(media.caption)} volume={media.volume ?? 1} dark={darkTheme} showMedia={media.type !== 'audio'} fullscreenRequest={playerFullscreenRequest} videoFullscreenRequest={videoFullscreenRequest} transcribing={transcribingMediaId === media.id} queued={queuedTranscriptionIds.has(media.id)} transcriptionProgress={progress} onTranscribe={transcribeMedia} onVolumeChange={saveMediaVolume} onToggleTheme={() => setDarkTheme((value) => !value)} />}
+        {media && <MediaPlayer key={media.id} mediaId={media.id} src={media.playbackPath || `library/${media.media}`} captions={captions} hasCaptions={Boolean(media.caption)} volume={media.volume ?? 1} initialPosition={media.seekPosition ?? 0} autoplay={autoplayNext} onPlayingChange={setMediaWasPlaying} onCurrentPosition={(mediaId, value) => { if (activeMediaRef.current?.id === mediaId) currentPositionRef.current = value; }} onPositionChange={saveMediaPosition} dark={darkTheme} showMedia={media.type !== 'audio'} fullscreenRequest={playerFullscreenRequest} videoFullscreenRequest={videoFullscreenRequest} transcribing={transcribingMediaId === media.id} queued={queuedTranscriptionIds.has(media.id)} transcriptionProgress={progress} onTranscribe={transcribeMedia} onVolumeChange={saveMediaVolume} onToggleTheme={() => setDarkTheme((value) => !value)} />}
       </section>
       </div>
       {contextMenu && <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>
@@ -507,18 +608,20 @@ function App() {
           <div><button type="button" onClick={() => setDeleteDialog(null)}>Cancel</button><button className="name-dialog__delete" type="button" onClick={confirmDelete}>Delete</button></div>
         </div>
       </div>}
+      {uploadSession && <div className="name-dialog-backdrop" onMouseDown={() => setUploadSession(null)}><div className="upload-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}><button className="upload-dialog__close" type="button" onClick={() => setUploadSession(null)} aria-label="Close"><X /></button><h3>Import from phone</h3><p>Scan this code with a phone on the same Wi-Fi network, then select one or more audio/video files.</p><img src={uploadSession.qrCode} alt={`QR code for ${uploadSession.url}`} /><code>{uploadSession.url}</code><div className="upload-dialog__queue">{uploads.length ? uploads.map((upload) => <div key={upload.id}><span>{upload.name}</span><span>{upload.state === 'uploading' ? <><progress value={upload.progress || 0} max="100" />{upload.progress || 0}%</> : upload.state === 'importing' ? 'Importing…' : upload.state === 'complete' ? 'Imported' : upload.state === 'error' ? 'Failed' : upload.state === 'cancelled' ? 'Cancelled' : upload.state === 'received' ? 'Received' : 'Queued'}</span></div>) : <p>Waiting for uploads…</p>}</div><button className="upload-dialog__cancel" type="button" onClick={cancelUploads}>Cancel pending uploads</button></div></div>}
     </main>
   );
 }
 
 function LibraryTree({ library, groups, selectedIds, activeId, expandedGroups, dragTargetGroup, inlineRename, transcribingMediaId, queuedTranscriptionIds, transcriptionProgress, onRenameChange, onRenameCommit, onSelect, onContextMenu, onDragStart, onToggleGroup, onDragTarget, onDrop }) {
   const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
-  return <nav className={`side-nav__items ${dragTargetGroup === 'root' ? 'is-root-drop-target' : ''}`} onContextMenu={(event) => { if (event.target === event.currentTarget) onContextMenu(event, 'root', null); }} onDragOver={(event) => { event.preventDefault(); onDragTarget('root'); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) onDragTarget(null); }} onDrop={(event) => onDrop(event, null)}>
+  const isRenaming = Boolean(inlineRename);
+  return <nav className={`side-nav__items ${dragTargetGroup === 'root' ? 'is-root-drop-target' : ''}`} onContextMenu={(event) => { if (event.target === event.currentTarget) onContextMenu(event, 'root', null); }} onDragOver={(event) => { if (isRenaming) return; event.preventDefault(); onDragTarget('root'); }} onDragLeave={(event) => { if (!isRenaming && !event.currentTarget.contains(event.relatedTarget)) onDragTarget(null); }} onDrop={(event) => { if (isRenaming) return; onDrop(event, null); }}>
     {[...groups].sort(byName).map((group) => {
       const expanded = expandedGroups.has(group.id);
       const groupMedia = library.filter((item) => item.groupId === group.id).sort(byName);
-      return <section key={group.id} className={`side-nav__group ${dragTargetGroup === group.id ? 'is-drop-target' : ''}`} onContextMenu={(event) => onContextMenu(event, 'group', group)} onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); onDragTarget(group.id); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) onDragTarget(null); }} onDrop={(event) => { event.stopPropagation(); onDrop(event, group.id); }}>
-        <button type="button" className={`side-nav__group-name ${expanded ? 'is-open' : ''}`} onClick={() => onToggleGroup(group.id)} aria-expanded={expanded}><span className="side-nav__folder" aria-hidden="true">{expanded ? <FolderOpen /> : <Folder />}</span>{inlineRename?.type === 'group' && inlineRename.id === group.id ? <InlineName rename={inlineRename} onChange={onRenameChange} onCommit={onRenameCommit} /> : <span>{group.name}</span>}<span className="side-nav__group-count">{groupMedia.length}</span></button>
+      return <section key={group.id} className={`side-nav__group ${dragTargetGroup === group.id ? 'is-drop-target' : ''}`} onContextMenu={(event) => onContextMenu(event, 'group', group)} onDragOver={(event) => { if (isRenaming) return; event.preventDefault(); event.stopPropagation(); onDragTarget(group.id); }} onDragLeave={(event) => { if (!isRenaming && !event.currentTarget.contains(event.relatedTarget)) onDragTarget(null); }} onDrop={(event) => { if (isRenaming) return; event.stopPropagation(); onDrop(event, group.id); }}>
+        <div className={`side-nav__group-name ${expanded ? 'is-open' : ''}`} role="button" tabIndex={0} onClick={() => onToggleGroup(group.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onToggleGroup(group.id); } }} aria-expanded={expanded}><span className="side-nav__folder" aria-hidden="true">{expanded ? <FolderOpen /> : <Folder />}</span>{inlineRename?.type === 'group' && inlineRename.id === group.id ? <InlineName className="side-nav__name side-nav__group-label" rename={inlineRename} onChange={onRenameChange} onCommit={onRenameCommit} /> : <span className="side-nav__name side-nav__group-label">{group.name}</span>}<span className="side-nav__group-count">{groupMedia.length}</span></div>
         {expanded && groupMedia.map((item) => <MediaItem key={item.id} item={item} selected={selectedIds.has(item.id)} active={activeId === item.id} inlineRename={inlineRename} transcribing={transcribingMediaId === item.id} queued={queuedTranscriptionIds.has(item.id)} progress={transcriptionProgress} onRenameChange={onRenameChange} onRenameCommit={onRenameCommit} onSelect={onSelect} onContextMenu={onContextMenu} onDragStart={onDragStart} onDragEnd={() => onDragTarget(null)} />)}
       </section>;
     })}
@@ -527,7 +630,7 @@ function LibraryTree({ library, groups, selectedIds, activeId, expandedGroups, d
   </nav>;
 }
 
-function InlineName({ rename, onChange, onCommit }) {
+function InlineName({ className, rename, onChange, onCommit }) {
   const editorRef = useRef(null);
 
   useEffect(() => {
@@ -541,13 +644,13 @@ function InlineName({ rename, onChange, onCommit }) {
     selection.addRange(range);
   }, []);
 
-  return <span ref={editorRef} className="side-nav__rename-editor" contentEditable suppressContentEditableWarning tabIndex={0} onBlur={(event) => onCommit(event.currentTarget.textContent)} onKeyDown={(event) => { event.stopPropagation(); if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); } if (event.key === 'Escape') { onChange(null); event.currentTarget.blur(); } }} onClick={(event) => event.stopPropagation()}>{rename.value}</span>;
+  return <span ref={editorRef} className={`${className || ''} side-nav__rename-editor`.trim()} contentEditable suppressContentEditableWarning tabIndex={0} onBlur={(event) => onCommit(event.currentTarget.textContent)} onKeyDown={(event) => { event.stopPropagation(); if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); } if (event.key === 'Escape') { onChange(null); event.currentTarget.blur(); } }} onClick={(event) => event.stopPropagation()}>{rename.value}</span>;
 }
 
 function MediaItem({ item, selected, active, inlineRename, transcribing, queued, progress, onRenameChange, onRenameCommit, onSelect, onContextMenu, onDragStart, onDragEnd }) {
-  return <button draggable key={item.id} type="button" className={`side-nav__item ${active ? 'is-selected' : ''} ${selected ? 'is-multi-selected' : ''}`} onClick={(event) => onSelect(item, event)} onContextMenu={(event) => onContextMenu(event, 'media', item)} onDragStart={(event) => { if (onDragStart) onDragStart(event, item); else event.dataTransfer.setData('text/media-id', item.id); }} onDragEnd={onDragEnd}>
+  return <button draggable={!inlineRename} key={item.id} type="button" className={`side-nav__item ${active ? 'is-selected' : ''} ${selected ? 'is-multi-selected' : ''}`} onClick={(event) => { if (inlineRename?.type === 'media' && inlineRename.id === item.id) return; onSelect(item, event); }} onContextMenu={(event) => onContextMenu(event, 'media', item)} onDragStart={(event) => { if (inlineRename) { event.preventDefault(); return; } if (onDragStart) onDragStart(event, item); else event.dataTransfer.setData('text/media-id', item.id); }} onDragEnd={onDragEnd}>
     <span className={`side-nav__media-icon side-nav__media-icon--${item.type || 'video'}`} aria-hidden="true">{item.type === 'audio' ? <Music /> : <Video />}</span>
-    <span className="side-nav__name">{inlineRename?.type === 'media' && inlineRename.id === item.id ? <InlineName rename={inlineRename} onChange={onRenameChange} onCommit={onRenameCommit} /> : item.name}</span>
+    {inlineRename?.type === 'media' && inlineRename.id === item.id ? <InlineName className="side-nav__name" rename={inlineRename} onChange={onRenameChange} onCommit={onRenameCommit} /> : <span className="side-nav__name">{item.name}</span>}
     {transcribing && <span className="side-nav__transcription-progress" style={{ '--progress': `${progress}%` }}>{progress}%</span>}
     {!transcribing && queued && <span className="side-nav__transcription-queued">Queued</span>}
     {!transcribing && item.caption && <Check className="side-nav__caption-check" aria-label="Captions available" />}

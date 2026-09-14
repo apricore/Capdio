@@ -5,6 +5,10 @@ const fsSync = require('node:fs');
 const fs = require('node:fs/promises');
 const { Readable } = require('node:stream');
 const crypto = require('node:crypto');
+const http = require('node:http');
+const os = require('node:os');
+const Busboy = require('busboy');
+const QRCode = require('qrcode');
 
 // Register before the app is ready so Chromium treats capdio as a first-class,
 // secure URL scheme. This is required for media elements to issue range requests.
@@ -18,6 +22,21 @@ protocol.registerSchemesAsPrivileged([{
         corsEnabled: true
     }
 }]);
+
+// Keep one Capdio process/window per user session. A subsequent launch brings
+// the existing window forward instead of starting a second library instance.
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+    app.quit();
+} else {
+    app.on('second-instance', () => {
+        const existingWindow = BrowserWindow.getAllWindows()[0];
+        if (!existingWindow) return;
+        if (existingWindow.isMinimized()) existingWindow.restore();
+        existingWindow.show();
+        existingWindow.focus();
+    });
+}
 
 const runtimeRoot = app.isPackaged ? process.resourcesPath : __dirname;
 const platformBinaryDirectory = path.join(runtimeRoot, 'bin', `${process.platform}-${process.arch}`);
@@ -44,6 +63,7 @@ if (app.isPackaged) {
 }
 const mediaDirectory = path.join(libraryRoot, 'media');
 const captionDirectory = path.join(libraryRoot, 'caption');
+const metadataDirectory = path.join(libraryRoot, 'metadata');
 const manifestPath = path.join(libraryRoot, 'manifest.json');
 
 function mediaType(filePath) {
@@ -58,6 +78,27 @@ function mediaMimeType(filePath) {
         '.mpeg': 'video/mpeg', '.mpg': 'video/mpeg', '.webm': 'video/webm'
     };
     return types[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+}
+
+const supportedMediaExtensions = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.mp4', '.mkv', '.avi', '.mov', '.webm']);
+let uploadSessionServer = null;
+let uploadSessionQueue = [];
+let uploadSessionRunning = false;
+let uploadSessionCurrent = null;
+const uploadSessionRecords = new Map();
+const uploadImportWaiters = new Map();
+const activeUploadRequests = new Set();
+
+function uploadHost() {
+    return Object.entries(os.networkInterfaces()).find(([name]) =>
+        /wi-?fi|wlan|wlp|en0/i.test(name)
+    )?.[1].find(addr =>
+        addr.family === 'IPv4' && !addr.internal
+    )?.address || '127.0.0.1';
+}
+
+function sendUploadStatus(payload) {
+    for (const window of BrowserWindow.getAllWindows()) window.webContents.send('upload-status', payload);
 }
 
 async function readManifest() {
@@ -78,34 +119,19 @@ async function writeManifest(manifest) {
     await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
-async function uniqueMediaPath(fileName) {
-    const parsed = path.parse(fileName);
-    let candidate = path.join(mediaDirectory, fileName);
-    let suffix = 2;
-
-    while (true) {
-        try {
-            await fs.access(candidate);
-            candidate = path.join(mediaDirectory, `${parsed.name}-${suffix}${parsed.ext}`);
-            suffix += 1;
-        } catch (error) {
-            if (error.code === 'ENOENT') return candidate;
-            throw error;
-        }
+function metadataPath(id) { return path.join(metadataDirectory, `${id}.json`); }
+async function readMetadata(id) {
+    try { return JSON.parse(await fs.readFile(metadataPath(id), 'utf8')); } catch (error) {
+        if (error.code === 'ENOENT') return { name: id, groupId: null, volume: 1, extension: '' };
+        throw error;
     }
 }
-
-async function moveMediaFile(source, destination) {
-    try {
-        await fs.rename(source, destination);
-    } catch (error) {
-        // A rename cannot cross volumes on some systems. Copy, then remove only
-        // after a successful copy to preserve the requested move semantics.
-        if (error.code !== 'EXDEV') throw error;
-        await fs.copyFile(source, destination);
-        await fs.unlink(source);
-    }
+async function writeMetadata(id, metadata) {
+    await fs.mkdir(metadataDirectory, { recursive: true });
+    await fs.writeFile(metadataPath(id), `${JSON.stringify(metadata, null, 2)}\n`);
 }
+function mediaPathFor(item) { return path.join(mediaDirectory, `${item.id}${item.extension}`); }
+function captionPathFor(item) { return path.join(captionDirectory, `${item.id}.captions.json`); }
 
 function createWindow() {
     const win = new BrowserWindow({
@@ -126,6 +152,12 @@ function createWindow() {
     } else {
         win.loadURL('http://localhost:5173');
     }
+    win.on('close', (event) => {
+        if (win.__capdioCloseAllowed) return;
+        event.preventDefault();
+        win.webContents.send('save-before-close');
+        setTimeout(() => { if (!win.isDestroyed()) { win.__capdioCloseAllowed = true; win.close(); } }, 1200);
+    });
 }
 
 ipcMain.handle('window-minimize', (event) => {
@@ -144,7 +176,8 @@ ipcMain.handle('window-toggle-maximize', (event) => {
 });
 
 ipcMain.handle('window-close', (event) => {
-    BrowserWindow.fromWebContents(event.sender)?.close();
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win) { win.__capdioCloseAllowed = true; win.close(); }
 });
 
 ipcMain.handle('toggle-developer-tools', (event) => {
@@ -188,25 +221,18 @@ ipcMain.handle('select-file', async () => {
 ipcMain.handle('get-library', async () => {
     const manifest = await readManifest();
     const media = await Promise.all(manifest.media.map(async (item) => {
+        const metadata = await readMetadata(item.id);
+        const mediaPath = mediaPathFor(item);
+        const captionPath = captionPathFor(item);
         let captions = [];
-        if (item.caption) {
-            const captionPath = path.resolve(libraryRoot, item.caption);
-            const allowedPath = `${captionDirectory}${path.sep}`;
-            if (!captionPath.startsWith(allowedPath)) {
-                throw new Error(`Invalid caption path in manifest: ${item.caption}`);
-            }
-            try {
-                const caption = JSON.parse(await fs.readFile(captionPath, 'utf8'));
-                captions = Array.isArray(caption.captions) ? caption.captions : [];
-            } catch (error) {
-                if (error.code !== 'ENOENT') throw error;
-            }
-        }
+        try { const caption = JSON.parse(await fs.readFile(captionPath, 'utf8')); captions = Array.isArray(caption.captions) ? caption.captions : []; } catch (error) { if (error.code !== 'ENOENT') throw error; }
         return {
             ...item,
-            type: item.type || mediaType(item.media),
-            absolutePath: path.resolve(libraryRoot, item.media),
-            playbackPath: `capdio://library/${item.media.split('/').map(encodeURIComponent).join('/')}`,
+            ...metadata, caption: (await fs.access(captionPath).then(() => `caption/${item.id}.captions.json`).catch(() => null)),
+            type: item.type,
+            media: `media/${item.id}${item.extension}`,
+            absolutePath: mediaPath,
+            playbackPath: `capdio://library/media/${item.id}${item.extension}`,
             captions
         };
     }));
@@ -241,6 +267,12 @@ ipcMain.handle('rename-library-item', async (event, type, id, name) => {
     const collection = type === 'group' ? manifest.groups : manifest.media;
     const item = collection.find((entry) => entry.id === id);
     if (!item) throw new Error(`${type} was not found.`);
+    if (type === 'media') {
+        const metadata = await readMetadata(id);
+        metadata.name = cleanName(name, 'Media');
+        await writeMetadata(id, metadata);
+        return { ...item, ...metadata };
+    }
     item.name = cleanName(name, type === 'group' ? 'Group' : 'Media');
     await writeManifest(manifest);
     return item;
@@ -252,33 +284,22 @@ ipcMain.handle('move-media-to-group', async (event, mediaIds, groupId) => {
         throw new Error('Group was not found.');
     }
     const ids = new Set(Array.isArray(mediaIds) ? mediaIds : []);
-    manifest.media.forEach((item) => {
-        if (ids.has(item.id)) item.groupId = groupId;
-    });
-    await writeManifest(manifest);
-    return manifest.media.filter((item) => ids.has(item.id));
+    const moving = manifest.media.filter((item) => ids.has(item.id));
+    await Promise.all(moving.map(async (item) => {
+        const metadata = await readMetadata(item.id);
+        metadata.groupId = groupId;
+        await writeMetadata(item.id, metadata);
+    }));
+    return moving;
 });
-
-async function removeProjectFile(relativePath, directory) {
-    const resolvedPath = path.resolve(libraryRoot, relativePath);
-    const allowedPath = `${directory}${path.sep}`;
-    if (!resolvedPath.startsWith(allowedPath)) {
-        throw new Error(`Invalid project file path: ${relativePath}`);
-    }
-    try {
-        await fs.unlink(resolvedPath);
-    } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-    }
-}
 
 ipcMain.handle('delete-media', async (event, mediaIds) => {
     const manifest = await readManifest();
     const ids = new Set(Array.isArray(mediaIds) ? mediaIds : []);
     const removing = manifest.media.filter((item) => ids.has(item.id));
     await Promise.all(removing.flatMap((item) => {
-        const files = [removeProjectFile(item.media, mediaDirectory)];
-        if (item.caption) files.push(removeProjectFile(item.caption, captionDirectory));
+        const files = [fs.unlink(mediaPathFor(item)).catch(() => {}), fs.unlink(metadataPath(item.id)).catch(() => {})];
+        files.push(fs.unlink(captionPathFor(item)).catch(() => {}));
         return files;
     }));
     manifest.media = manifest.media.filter((item) => !ids.has(item.id));
@@ -292,8 +313,7 @@ ipcMain.handle('delete-group', async (event, groupId) => {
     if (!group) throw new Error('Group was not found.');
     const removing = manifest.media.filter((item) => item.groupId === groupId);
     await Promise.all(removing.flatMap((item) => {
-        const files = [removeProjectFile(item.media, mediaDirectory)];
-        if (item.caption) files.push(removeProjectFile(item.caption, captionDirectory));
+        const files = [fs.unlink(mediaPathFor(item)).catch(() => {}), fs.unlink(metadataPath(item.id)).catch(() => {}), fs.unlink(captionPathFor(item)).catch(() => {})];
         return files;
     }));
     manifest.groups = manifest.groups.filter((item) => item.id !== groupId);
@@ -302,17 +322,18 @@ ipcMain.handle('delete-group', async (event, groupId) => {
     return { groupId, mediaIds: removing.map((item) => item.id) };
 });
 
-ipcMain.handle('import-media', async (event, sourceFile, groupId = null) => {
+async function importMediaFile(sourceFile, groupId = null, originalName = path.basename(sourceFile)) {
     if (!sourceFile || typeof sourceFile !== 'string') {
         throw new Error('A media file is required.');
     }
 
     await fs.mkdir(mediaDirectory, { recursive: true });
-    await fs.mkdir(captionDirectory, { recursive: true });
+    await fs.mkdir(captionDirectory, { recursive: true }); await fs.mkdir(metadataDirectory, { recursive: true });
 
-    const sourceName = path.basename(sourceFile);
+    const sourceName = path.basename(originalName);
     const extension = path.extname(sourceName);
-    const destination = path.join(mediaDirectory, `${crypto.randomUUID()}${extension}`);
+    const id = crypto.randomUUID();
+    const destination = path.join(mediaDirectory, `${id}${extension}`);
     await fs.copyFile(sourceFile, destination);
 
     const manifest = await readManifest();
@@ -320,22 +341,149 @@ ipcMain.handle('import-media', async (event, sourceFile, groupId = null) => {
         throw new Error('Group was not found.');
     }
     const item = {
-        id: crypto.randomUUID(),
-        name: path.parse(sourceName).name,
-        type: mediaType(sourceName),
-        media: path.relative(libraryRoot, destination).replace(/\\/g, '/'),
-        caption: null,
-        volume: 1,
-        importedAt: new Date().toISOString(),
-        groupId
+        id,
+        type: mediaType(sourceName), extension,
+        importedAt: new Date().toISOString()
     };
     manifest.media.push(item);
     await writeManifest(manifest);
+    await writeMetadata(id, { name: path.parse(sourceName).name, groupId, volume: 1 });
     return {
         ...item,
         absolutePath: destination,
-        playbackPath: `capdio://library/${item.media.split('/').map(encodeURIComponent).join('/')}`
+        playbackPath: `capdio://library/media/${id}${extension}`,
+        media: `media/${id}${extension}`, caption: null, name: path.parse(sourceName).name, groupId, volume: 1
     };
+}
+
+ipcMain.handle('import-media', (event, sourceFile, groupId = null) => {
+    return importMediaFile(sourceFile, groupId);
+});
+
+async function processUploadQueue() {
+    if (uploadSessionRunning) return;
+    uploadSessionRunning = true;
+    while (uploadSessionQueue.length) {
+        const upload = uploadSessionQueue.shift();
+        uploadSessionCurrent = upload;
+        uploadSessionRecords.set(upload.id, { ...upload, state: 'importing' });
+        sendUploadStatus({ id: upload.id, name: upload.name, state: 'importing', queued: uploadSessionQueue.length });
+        try {
+            const item = await importMediaFile(upload.path, null, upload.name);
+            await fs.unlink(upload.path).catch(() => {});
+            uploadSessionRecords.set(upload.id, { ...upload, state: 'complete' });
+            uploadImportWaiters.get(upload.id)?.resolve({ ok: true, item });
+            uploadImportWaiters.delete(upload.id);
+            sendUploadStatus({ id: upload.id, name: upload.name, state: 'complete', item, queued: uploadSessionQueue.length });
+        } catch (error) {
+            await fs.unlink(upload.path).catch(() => {});
+            uploadSessionRecords.set(upload.id, { ...upload, state: 'error' });
+            uploadImportWaiters.get(upload.id)?.resolve({ ok: false, error: error.message });
+            uploadImportWaiters.delete(upload.id);
+            sendUploadStatus({ id: upload.id, name: upload.name, state: 'error', error: error.message, queued: uploadSessionQueue.length });
+        }
+    }
+    uploadSessionCurrent = null;
+    uploadSessionRunning = false;
+}
+
+function uploadQueueStatus(ids = []) {
+    const active = uploadSessionCurrent ? [uploadSessionCurrent, ...uploadSessionQueue] : [...uploadSessionQueue];
+    const total = active.length;
+    return { total, items: ids.map((id) => {
+        const record = uploadSessionRecords.get(id);
+        const position = active.findIndex((upload) => upload.id === id);
+        return record ? { id, name: record.name, state: record.state, position: position < 0 ? null : position + 1, total } : { id, state: 'unknown', position: null, total };
+    }) };
+}
+
+ipcMain.handle('start-upload', async () => {
+    if (!uploadSessionServer) {
+        const stagingDirectory = path.join(libraryRoot, '.uploads');
+        await fs.mkdir(stagingDirectory, { recursive: true });
+        uploadSessionServer = http.createServer((request, response) => {
+            const pagePath = '/upload';
+            const uploadPath = `${pagePath}/upload`;
+            const statusPath = `${pagePath}/status`;
+            if (request.method === 'GET' && request.url === pagePath) {
+                response.writeHead(200, {
+                    'Content-Type': 'text/html; charset=utf-8',
+                    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
+                });
+                fs.readFile(path.join(__dirname, 'upload.html'), 'utf8')
+                    .then((page) => response.end(page))
+                    .catch(() => { response.writeHead(500); response.end('Capdio upload page is unavailable.'); });
+                return;
+            }
+            if (request.method === 'GET' && request.url.startsWith(statusPath)) {
+                const ids = new URL(request.url, 'http://capdio.local').searchParams.get('ids')?.split(',').filter(Boolean) || [];
+                response.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+                response.end(JSON.stringify(uploadQueueStatus(ids)));
+                return;
+            }
+            if (request.method !== 'POST' || request.url !== uploadPath) { response.writeHead(404).end(); return; }
+            let parser;
+            try { parser = Busboy({ headers: request.headers, defParamCharset: 'utf8', limits: { files: 30, fileSize: 10 * 1024 * 1024 * 1024 } }); } catch { response.writeHead(400).end('Invalid upload.'); return; }
+            const saved = [];
+            const writes = [];
+            const uploadRequest = { request, saved, cancelled: false };
+            activeUploadRequests.add(uploadRequest);
+            const discardPartialUploads = async () => {
+                uploadRequest.cancelled = true;
+                await Promise.all(saved.map((upload) => fs.unlink(upload.path).catch(() => {})));
+                sendUploadStatus({ id: 'transfer', name: 'Receiving files from phone', state: 'cancelled' });
+            };
+            request.on('aborted', () => { discardPartialUploads(); activeUploadRequests.delete(uploadRequest); });
+            const totalBytes = Number(request.headers['content-length']) || 0;
+            let receivedBytes = 0;
+            let lastProgressAt = 0;
+            request.on('data', (chunk) => {
+                receivedBytes += chunk.length;
+                const now = Date.now();
+                if (totalBytes && now - lastProgressAt > 120) {
+                    lastProgressAt = now;
+                    sendUploadStatus({ id: 'transfer', name: 'Receiving files from phone', state: 'uploading', progress: Math.min(99, Math.round(receivedBytes / totalBytes * 100)) });
+                }
+            });
+            parser.on('file', (_field, stream, info) => {
+                const name = path.basename(info.filename || 'media');
+                const extension = path.extname(name).toLowerCase();
+                if (!supportedMediaExtensions.has(extension)) { stream.resume(); return; }
+                const upload = { id: crypto.randomUUID(), name, path: path.join(stagingDirectory, `${crypto.randomUUID()}${extension}`) };
+                saved.push(upload);
+                const output = fsSync.createWriteStream(upload.path);
+                stream.pipe(output);
+                writes.push(new Promise((resolve, reject) => { output.on('close', resolve); output.on('error', reject); stream.on('limit', () => reject(new Error(`${name} is too large.`))); }));
+            });
+            parser.on('finish', async () => {
+                try {
+                    await Promise.all(writes);
+                    if (uploadRequest.cancelled) return;
+                    sendUploadStatus({ id: 'transfer', name: 'Receiving files from phone', state: 'received', progress: 100 });
+                    const completed = saved.map((upload) => new Promise((resolve) => uploadImportWaiters.set(upload.id, { resolve })));
+                    uploadSessionQueue.push(...saved);
+                    saved.forEach((upload) => { uploadSessionRecords.set(upload.id, { ...upload, state: 'queued' }); sendUploadStatus({ id: upload.id, name: upload.name, state: 'queued', queued: uploadSessionQueue.length }); });
+                    processUploadQueue();
+                    const results = await Promise.all(completed);
+                    response.writeHead(results.every((result) => result.ok) ? 201 : 500, { 'Content-Type': 'application/json' });
+                    response.end(JSON.stringify({ results }));
+                } catch (error) { await Promise.all(saved.map((upload) => fs.unlink(upload.path).catch(() => {}))); response.writeHead(400).end(error.message); } finally { activeUploadRequests.delete(uploadRequest); }
+            });
+            request.pipe(parser);
+        });
+        await new Promise((resolve, reject) => { uploadSessionServer.once('error', reject); uploadSessionServer.listen(0, '0.0.0.0', resolve); });
+    }
+    const { port } = uploadSessionServer.address();
+    const url = `http://${uploadHost()}:${port}/upload`;
+    return { url, qrCode: await QRCode.toDataURL(url, { margin: 1, width: 280 }) };
+});
+
+ipcMain.handle('cancel-uploads', async () => {
+    const queued = uploadSessionQueue.splice(0);
+    await Promise.all(queued.map((upload) => fs.unlink(upload.path).catch(() => {})));
+    queued.forEach((upload) => { uploadSessionRecords.set(upload.id, { ...upload, state: 'cancelled' }); uploadImportWaiters.get(upload.id)?.resolve({ ok: false, error: 'Cancelled' }); uploadImportWaiters.delete(upload.id); sendUploadStatus({ id: upload.id, name: upload.name, state: 'cancelled' }); });
+    for (const uploadRequest of activeUploadRequests) uploadRequest.request.destroy();
+    return true;
 });
 
 ipcMain.handle('set-media-volume', async (event, mediaId, value) => {
@@ -346,9 +494,18 @@ ipcMain.handle('set-media-volume', async (event, mediaId, value) => {
     const manifest = await readManifest();
     const item = manifest.media.find((entry) => entry.id === mediaId);
     if (!item) throw new Error('The imported media entry was not found in manifest.json.');
-    item.volume = volume;
-    await writeManifest(manifest);
+    const metadata = await readMetadata(mediaId);
+    metadata.volume = volume;
+    await writeMetadata(mediaId, metadata);
     return volume;
+});
+
+ipcMain.handle('set-media-position', async (event, mediaId, value) => {
+    const position = Math.max(0, Number(value) || 0);
+    const metadata = await readMetadata(mediaId);
+    metadata.seekPosition = position;
+    await writeMetadata(mediaId, metadata);
+    return position;
 });
 
 ipcMain.handle('save-transcription', async (event, mediaId, transcription) => {
@@ -361,21 +518,19 @@ ipcMain.handle('save-transcription', async (event, mediaId, transcription) => {
         e: secondsToTimestamp(segment.end),
         t: String(segment.text || '').trim()
     })).filter((segment) => segment.t);
-    const captionName = `${path.parse(item.media).name}.captions.json`;
-    const captionPath = path.join(captionDirectory, captionName);
+    const captionPath = captionPathFor(item);
     const caption = {
         version: 1,
-        media: item.media,
+        media: item.id,
         text: transcription.text || '',
         captions,
         generatedAt: new Date().toISOString()
     };
 
     await fs.writeFile(captionPath, `${JSON.stringify(caption, null, 2)}\n`);
-    item.caption = path.relative(libraryRoot, captionPath).replace(/\\/g, '/');
     item.transcribedAt = caption.generatedAt;
     await writeManifest(manifest);
-    return { caption, captionPath, captionRelativePath: item.caption };
+    return { caption, captionPath, captionRelativePath: `caption/${item.id}.captions.json` };
 });
 
 function secondsToTimestamp(seconds) {
@@ -478,7 +633,7 @@ ipcMain.handle('transcribe', async (event, mediaId) => {
     const item = manifest.media.find((entry) => entry.id === mediaId);
     if (!item) throw new Error('The imported media entry was not found in manifest.json.');
 
-    const audioFile = path.resolve(libraryRoot, item.media);
+    const audioFile = mediaPathFor(item);
     const relativePath = path.relative(mediaDirectory, audioFile);
     if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
         throw new Error('The media entry points outside the Capdio media library.');
@@ -612,6 +767,7 @@ ipcMain.handle('copy-text', (event, value) => {
 });
 
 app.whenReady().then(async () => {
+    if (!hasSingleInstanceLock) return;
     protocol.handle('capdio', async (request) => {
         const url = new URL(request.url);
         if (url.hostname !== 'library') {
