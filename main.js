@@ -28,7 +28,20 @@ const transcriberExecutable = app.isPackaged
     ? path.join(platformBinaryDirectory, 'capdio-transcribe', process.platform === 'win32' ? 'capdio-transcribe.exe' : 'capdio-transcribe')
     : 'python';
 const whisperModelDirectory = app.isPackaged ? path.join(runtimeRoot, 'models') : null;
-const libraryRoot = app.isPackaged ? path.join(app.getPath('userData'), 'library') : path.join(__dirname, 'library');
+const defaultLibraryRoot = app.isPackaged ? path.join(app.getPath('userData'), 'library') : path.join(__dirname, 'library');
+const libraryLocationConfigPath = path.join(app.getPath('userData'), 'library-path.txt');
+let libraryRoot = defaultLibraryRoot;
+
+// The assisted Windows installer writes this small pointer after the user picks
+// a library location. Development always keeps its library inside the project.
+if (app.isPackaged) {
+    try {
+        const configuredPath = fsSync.readFileSync(libraryLocationConfigPath, 'utf8').trim();
+        if (configuredPath) libraryRoot = path.resolve(configuredPath);
+    } catch {
+        // First launch or an older installation: use the standard user-data path.
+    }
+}
 const mediaDirectory = path.join(libraryRoot, 'media');
 const captionDirectory = path.join(libraryRoot, 'caption');
 const manifestPath = path.join(libraryRoot, 'manifest.json');

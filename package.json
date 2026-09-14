@@ -52,6 +52,11 @@
     "win": {
       "target": "nsis",
       "icon": "assets/capdio-icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "include": "installer.nsh"
     }
   },
   "devDependencies": {

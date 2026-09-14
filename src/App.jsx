@@ -457,7 +457,7 @@ function App() {
       <div className="app-shell" style={{ '--side-nav-width': `${sideNavWidth}px` }}>
       <aside className="side-nav" aria-label="Media library">
         <div className="side-nav__header"><img src={capdioIcon} alt="" draggable="false" /><div><h1>Capdio</h1><p>Media studio</p></div><span className="side-nav__count">{library.length}</span></div>
-        <button className="side-nav__import" type="button" onClick={() => chooseMedia()} disabled={isImporting || isTranscribing}>
+        <button className="side-nav__import" type="button" onClick={() => chooseMedia()} disabled={isImporting}>
           {isImporting ? 'Importing...' : 'Import media'}
         </button>
         <button className="side-nav__new-group" type="button" onClick={createGroup}>+ New group</button>
