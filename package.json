@@ -1,6 +1,6 @@
 {
   "name": "Capdio",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Capdio is for transcribe and play local audio/video files with interactive captions",
   "main": "main.js",
   "scripts": {
@@ -28,6 +28,9 @@
     "files": [
       "dist/**/*",
       "main.js",
+      "dictionary.js",
+      "dictionary.html",
+      "src/App.css",
       "upload.html",
       "package.json",
       "assets/**/*"

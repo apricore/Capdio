@@ -28,11 +28,19 @@ function App() {
   const [transcribingMediaId, setTranscribingMediaId] = useState(null);
   const [queuedTranscriptionIds, setQueuedTranscriptionIds] = useState(new Set());
   const [darkTheme, setDarkTheme] = useState(() => localStorage.getItem('capdio-theme') !== 'light');
+  useEffect(() => {
+    const receiveTheme = (_event, dark) => setDarkTheme(dark);
+    ipcRenderer.on('dictionary-theme-changed', receiveTheme);
+    return () => ipcRenderer.removeListener('dictionary-theme-changed', receiveTheme);
+  }, []);
   const [sideNavWidth, setSideNavWidth] = useState(() => Number(localStorage.getItem('capdio-side-nav-width')) || 282);
   const [playerFullscreenRequest, setPlayerFullscreenRequest] = useState(0);
   const [videoFullscreenRequest, setVideoFullscreenRequest] = useState(0);
   const [mediaWasPlaying, setMediaWasPlaying] = useState(false);
   const [autoplayNext, setAutoplayNext] = useState(false);
+  const [playbackToggleRequest, setPlaybackToggleRequest] = useState(0);
+  const [playbackSeekRequest, setPlaybackSeekRequest] = useState({ sequence: 0, seconds: 0 });
+  const [volumeRevealRequest, setVolumeRevealRequest] = useState(0);
   const libraryRef = useRef([]);
   const transcriptionQueueRef = useRef([]);
   const isQueueRunningRef = useRef(false);
@@ -60,7 +68,9 @@ function App() {
   }, [library]);
 
   useEffect(() => {
+    document.documentElement.style.setProperty('--startup-bg', darkTheme ? '#111827' : '#f4f6fb');
     localStorage.setItem('capdio-theme', darkTheme ? 'dark' : 'light');
+    ipcRenderer.send('dictionary-theme', darkTheme);
   }, [darkTheme]);
 
   useEffect(() => {
@@ -92,6 +102,28 @@ function App() {
 
   useEffect(() => {
     const handleWindowShortcuts = (event) => {
+      if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'd') {
+        event.preventDefault();
+        if (!event.repeat) {
+          ipcRenderer.invoke('dictionary-open').catch((error) => {
+            window.alert(`Unable to open dictionary: ${error.message}`);
+          });
+        }
+      }
+      if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 's') {
+        const selection = window.getSelection();
+        const word = selection?.toString().trim();
+        const book = selection?.anchorNode?.parentElement?.closest('.media-player__book');
+        if (word && book && book.contains(selection.focusNode)) {
+          event.preventDefault();
+          if (!event.repeat) {
+            selection.removeAllRanges();
+            ipcRenderer.invoke('dictionary-lookup', word).catch((error) => {
+              window.alert(`Dictionary lookup failed: ${error.message}`);
+            });
+          }
+        }
+      }
       if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'o' && !isImporting) {
         event.preventDefault();
         chooseMedia();
@@ -99,6 +131,23 @@ function App() {
       if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 't') {
         event.preventDefault();
         setDarkTheme((value) => !value);
+      }
+      const target = event.target;
+      const isEditingText = target instanceof HTMLElement && (target.matches('input, textarea, [contenteditable="true"]') || target.isContentEditable);
+      if (media && !isEditingText && !event.ctrlKey && !event.altKey && !event.metaKey && (event.key === ' ' || event.key === 'Enter')) {
+        event.preventDefault();
+        setPlaybackToggleRequest((value) => value + 1);
+        return;
+      }
+      if (media && !isEditingText && !event.ctrlKey && !event.altKey && !event.metaKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+        event.preventDefault();
+        adjustMediaVolume(event.key === 'ArrowUp' ? 0.05 : -0.05);
+        return;
+      }
+      if (media && !isEditingText && !event.ctrlKey && !event.altKey && !event.metaKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+        event.preventDefault();
+        setPlaybackSeekRequest((request) => ({ sequence: request.sequence + 1, seconds: event.key === 'ArrowLeft' ? -5 : 5 }));
+        return;
       }
       if (event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'f' && media) {
         event.preventDefault();
@@ -113,6 +162,16 @@ function App() {
     return () => window.removeEventListener('keydown', handleWindowShortcuts);
   }, [media, isImporting]);
 
+  useEffect(() => {
+    const blurNonTextControls = (event) => {
+      const control = event.target;
+      if (!(control instanceof HTMLElement) || control.isContentEditable) return;
+      if (control.matches('button, [role="button"], input[type="range"]')) control.blur();
+    };
+    document.addEventListener('focusin', blurNonTextControls);
+    return () => document.removeEventListener('focusin', blurNonTextControls);
+  }, []);
+
   function beginSideNavResize(event) {
     event.preventDefault();
     const onMove = (moveEvent) => setSideNavWidth(Math.min(460, Math.max(190, moveEvent.clientX)));
@@ -124,11 +183,12 @@ function App() {
     document.addEventListener('pointerup', onEnd, { once: true });
   }
 
-  async function saveMediaVolume(value) {
-    if (!media) return;
+  async function saveMediaVolume(value, targetMedia = activeMediaRef.current) {
+    if (!targetMedia) return;
     const volume = Math.max(0, Math.min(1, Number(value)));
-    const mediaId = media.id;
-    const updated = { ...media, volume };
+    const mediaId = targetMedia.id;
+    const updated = { ...targetMedia, volume };
+    if (activeMediaRef.current?.id === mediaId) activeMediaRef.current = updated;
     setMedia(updated);
     setLibrary((items) => items.map((item) => item.id === mediaId ? { ...item, volume } : item));
     clearTimeout(volumeSaveTimerRef.current);
@@ -139,6 +199,13 @@ function App() {
         setStatus(`Could not save volume: ${error.message}`);
       }
     }, 220);
+  }
+
+  function adjustMediaVolume(delta) {
+    const active = activeMediaRef.current;
+    if (!active) return;
+    saveMediaVolume((active.volume ?? 1) + delta, active);
+    setVolumeRevealRequest((value) => value + 1);
   }
 
   function selectMedia(item, event) {
@@ -382,6 +449,26 @@ function App() {
       .finally(() => ipcRenderer.invoke('window-close'));
   }
 
+  async function exportGroup(group) {
+    setContextMenu(null);
+    try {
+      const result = await ipcRenderer.invoke('export-group', group.id);
+      if (result) setStatus(`Exported ${result.count} media files to ${result.destination}.`);
+    } catch (error) {
+      setStatus(`Could not export group: ${error.message}`);
+      window.alert(`Could not export group: ${error.message}`);
+    }
+  }
+  async function exportMedia(item) {
+    setContextMenu(null);
+    try {
+      const destination = await ipcRenderer.invoke('export-media', item.id);
+      if (destination) setStatus(`Exported ${item.name} to ${destination}.`);
+    } catch (error) {
+      setStatus(`Could not export media: ${error.message}`);
+      window.alert(`Could not export media: ${error.message}`);
+    }
+  }
   function createGroup() {
     setNameDialog({ mode: 'create-group', title: 'New group', value: '' });
   }
@@ -463,9 +550,9 @@ function App() {
     preview.textContent = ids.length === 1 ? item.name : `${ids.length} media items`;
     Object.assign(preview.style, {
       position: 'fixed', top: '-1000px', left: '-1000px',
-      maxWidth: '240px', padding: '8px 12px', border: '1px solid rgba(139, 140, 255, .9)',
-      borderRadius: '9px', color: '#edf2ff', background: '#222d43',
-      boxShadow: '0 10px 24px rgba(0, 0, 0, .35)', font: '600 12px Inter, sans-serif',
+      maxWidth: '240px', padding: '8px 12px', border: darkTheme ? '1px solid rgba(139, 140, 255, .9)' : '1px solid #818cf8',
+      borderRadius: '9px', color: darkTheme ? '#edf2ff' : '#272b63', background: darkTheme ? '#222d43' : '#f8f9ff',
+      boxShadow: darkTheme ? '0 10px 24px rgba(0, 0, 0, .35)' : '0 10px 24px rgba(59, 66, 129, .2)', font: '600 12px Inter, sans-serif',
       whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
     });
     document.body.append(preview);
@@ -578,18 +665,20 @@ function App() {
       <div className="side-nav__resize-handle" role="separator" aria-label="Resize media library" aria-orientation="vertical" onPointerDown={beginSideNavResize} />
 
       <section className="workspace">
-        {media && <MediaPlayer key={media.id} mediaId={media.id} src={media.playbackPath || `library/${media.media}`} captions={captions} hasCaptions={Boolean(media.caption)} volume={media.volume ?? 1} initialPosition={media.seekPosition ?? 0} autoplay={autoplayNext} onPlayingChange={setMediaWasPlaying} onCurrentPosition={(mediaId, value) => { if (activeMediaRef.current?.id === mediaId) currentPositionRef.current = value; }} onPositionChange={saveMediaPosition} dark={darkTheme} showMedia={media.type !== 'audio'} fullscreenRequest={playerFullscreenRequest} videoFullscreenRequest={videoFullscreenRequest} transcribing={transcribingMediaId === media.id} queued={queuedTranscriptionIds.has(media.id)} transcriptionProgress={progress} onTranscribe={transcribeMedia} onVolumeChange={saveMediaVolume} onToggleTheme={() => setDarkTheme((value) => !value)} />}
+        {media && <MediaPlayer key={media.id} mediaId={media.id} src={media.playbackPath || `library/${media.media}`} captions={captions} hasCaptions={Boolean(media.caption)} volume={media.volume ?? 1} volumeRevealRequest={volumeRevealRequest} playbackToggleRequest={playbackToggleRequest} playbackSeekRequest={playbackSeekRequest} initialPosition={media.seekPosition ?? 0} autoplay={autoplayNext} onPlayingChange={setMediaWasPlaying} onCurrentPosition={(mediaId, value) => { if (activeMediaRef.current?.id === mediaId) currentPositionRef.current = value; }} onPositionChange={saveMediaPosition} dark={darkTheme} showMedia={media.type !== 'audio'} fullscreenRequest={playerFullscreenRequest} videoFullscreenRequest={videoFullscreenRequest} transcribing={transcribingMediaId === media.id} queued={queuedTranscriptionIds.has(media.id)} transcriptionProgress={progress} onTranscribe={transcribeMedia} onVolumeChange={saveMediaVolume} onToggleTheme={() => setDarkTheme((value) => !value)} />}
       </section>
       </div>
       {contextMenu && <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>
         {contextMenu.type !== 'root' && <button type="button" onClick={() => { renameItem(contextMenu.type, contextMenu.item); setContextMenu(null); }}>Rename</button>}
         {contextMenu.type === 'group' && <button type="button" onClick={() => { chooseMedia(contextMenu.item.id); setContextMenu(null); }}>Import media</button>}
+        {contextMenu.type === 'group' && <button type="button" onClick={() => exportGroup(contextMenu.item)}>Export group</button>}
         {contextMenu.type === 'group' && <button type="button" disabled={!contextScopeHasEligibleTranscription} onClick={() => { transcribeGroup(contextMenu.item); setContextMenu(null); }}>Transcribe all</button>}
         {contextMenu.type === 'group' && contextScopeHasTranscribing && <button type="button" onClick={() => { cancelGroupTranscriptions(contextMenu.item); setContextMenu(null); }}>Cancel all transcriptions</button>}
         {contextMenu.type === 'group' && <button type="button" className="context-menu__delete" onClick={() => { requestDeleteGroup(contextMenu.item); setContextMenu(null); }}>Delete group</button>}
         {contextMenu.type === 'root' && <button type="button" onClick={() => { chooseMedia(); setContextMenu(null); }}>Import media</button>}
         {contextMenu.type === 'root' && <button type="button" disabled={!contextScopeHasEligibleTranscription} onClick={() => { transcribeUngrouped(); setContextMenu(null); }}>Transcribe all</button>}
         {contextMenu.type === 'root' && contextScopeHasTranscribing && <button type="button" onClick={() => { cancelUngroupedTranscriptions(); setContextMenu(null); }}>Cancel all transcriptions</button>}
+        {contextMenu.type === 'media' && <button type="button" onClick={() => exportMedia(contextMenu.item)}>Export</button>}
         {contextMenu.type === 'media' && transcribingMediaId === contextMenu.item.id && <button type="button" onClick={() => { cancelTranscription(); setContextMenu(null); }}>Cancel transcription</button>}
         {contextMenu.type === 'media' && transcribingMediaId !== contextMenu.item.id && queuedTranscriptionIds.has(contextMenu.item.id) && <button type="button" onClick={() => { dequeueTranscription(contextMenu.item.id); setContextMenu(null); }}>Dequeue / Exclude</button>}
         {contextMenu.type === 'media' && transcribingMediaId !== contextMenu.item.id && !queuedTranscriptionIds.has(contextMenu.item.id) && <button type="button" disabled={Boolean(contextMenu.item.caption)} onClick={() => { enqueueFromTarget(contextMenu.item); setContextMenu(null); }}>{contextMenu.item.caption ? 'Transcribed' : 'Transcribe'}</button>}
@@ -622,7 +711,7 @@ function LibraryTree({ library, groups, selectedIds, activeId, expandedGroups, d
       const groupMedia = library.filter((item) => item.groupId === group.id).sort(byName);
       return <section key={group.id} className={`side-nav__group ${dragTargetGroup === group.id ? 'is-drop-target' : ''}`} onContextMenu={(event) => onContextMenu(event, 'group', group)} onDragOver={(event) => { if (isRenaming) return; event.preventDefault(); event.stopPropagation(); onDragTarget(group.id); }} onDragLeave={(event) => { if (!isRenaming && !event.currentTarget.contains(event.relatedTarget)) onDragTarget(null); }} onDrop={(event) => { if (isRenaming) return; event.stopPropagation(); onDrop(event, group.id); }}>
         <div className={`side-nav__group-name ${expanded ? 'is-open' : ''}`} role="button" tabIndex={0} onClick={() => onToggleGroup(group.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onToggleGroup(group.id); } }} aria-expanded={expanded}><span className="side-nav__folder" aria-hidden="true">{expanded ? <FolderOpen /> : <Folder />}</span>{inlineRename?.type === 'group' && inlineRename.id === group.id ? <InlineName className="side-nav__name side-nav__group-label" rename={inlineRename} onChange={onRenameChange} onCommit={onRenameCommit} /> : <span className="side-nav__name side-nav__group-label">{group.name}</span>}<span className="side-nav__group-count">{groupMedia.length}</span></div>
-        {expanded && groupMedia.map((item) => <MediaItem key={item.id} item={item} selected={selectedIds.has(item.id)} active={activeId === item.id} inlineRename={inlineRename} transcribing={transcribingMediaId === item.id} queued={queuedTranscriptionIds.has(item.id)} progress={transcriptionProgress} onRenameChange={onRenameChange} onRenameCommit={onRenameCommit} onSelect={onSelect} onContextMenu={onContextMenu} onDragStart={onDragStart} onDragEnd={() => onDragTarget(null)} />)}
+        <div className={`side-nav__group-content ${expanded ? 'is-expanded' : ''}`}><div>{groupMedia.map((item) => <MediaItem key={item.id} item={item} selected={selectedIds.has(item.id)} active={activeId === item.id} inlineRename={inlineRename} transcribing={transcribingMediaId === item.id} queued={queuedTranscriptionIds.has(item.id)} progress={transcriptionProgress} onRenameChange={onRenameChange} onRenameCommit={onRenameCommit} onSelect={onSelect} onContextMenu={onContextMenu} onDragStart={onDragStart} onDragEnd={() => onDragTarget(null)} />)}</div></div>
       </section>;
     })}
     {library.filter((item) => !item.groupId).sort(byName).map((item) => <MediaItem key={item.id} item={item} selected={selectedIds.has(item.id)} active={activeId === item.id} inlineRename={inlineRename} transcribing={transcribingMediaId === item.id} queued={queuedTranscriptionIds.has(item.id)} progress={transcriptionProgress} onRenameChange={onRenameChange} onRenameCommit={onRenameCommit} onSelect={onSelect} onContextMenu={onContextMenu} onDragStart={onDragStart} onDragEnd={() => onDragTarget(null)} />)}
@@ -648,13 +737,13 @@ function InlineName({ className, rename, onChange, onCommit }) {
 }
 
 function MediaItem({ item, selected, active, inlineRename, transcribing, queued, progress, onRenameChange, onRenameCommit, onSelect, onContextMenu, onDragStart, onDragEnd }) {
-  return <button draggable={!inlineRename} key={item.id} type="button" className={`side-nav__item ${active ? 'is-selected' : ''} ${selected ? 'is-multi-selected' : ''}`} onClick={(event) => { if (inlineRename?.type === 'media' && inlineRename.id === item.id) return; onSelect(item, event); }} onContextMenu={(event) => onContextMenu(event, 'media', item)} onDragStart={(event) => { if (inlineRename) { event.preventDefault(); return; } if (onDragStart) onDragStart(event, item); else event.dataTransfer.setData('text/media-id', item.id); }} onDragEnd={onDragEnd}>
+  return <div draggable={!inlineRename} key={item.id} role="button" className={`side-nav__item ${active ? 'is-selected' : ''} ${selected ? 'is-multi-selected' : ''}`} onClick={(event) => { if (inlineRename?.type === 'media' && inlineRename.id === item.id) return; onSelect(item, event); }} onContextMenu={(event) => onContextMenu(event, 'media', item)} onDragStart={(event) => { if (inlineRename) { event.preventDefault(); return; } if (onDragStart) onDragStart(event, item); else event.dataTransfer.setData('text/media-id', item.id); }} onDragEnd={onDragEnd}>
     <span className={`side-nav__media-icon side-nav__media-icon--${item.type || 'video'}`} aria-hidden="true">{item.type === 'audio' ? <Music /> : <Video />}</span>
     {inlineRename?.type === 'media' && inlineRename.id === item.id ? <InlineName className="side-nav__name" rename={inlineRename} onChange={onRenameChange} onCommit={onRenameCommit} /> : <span className="side-nav__name">{item.name}</span>}
     {transcribing && <span className="side-nav__transcription-progress" style={{ '--progress': `${progress}%` }}>{progress}%</span>}
     {!transcribing && queued && <span className="side-nav__transcription-queued">Queued</span>}
     {!transcribing && item.caption && <Check className="side-nav__caption-check" aria-label="Captions available" />}
-  </button>;
+  </div>;
 }
 
 export default App;

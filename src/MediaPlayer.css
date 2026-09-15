@@ -207,10 +207,10 @@
 .media-player__buttons button.is-on { color: var(--player-accent-strong); background: var(--player-active-bg); }
 .media-player__buttons svg { width: 18px; height: 18px; stroke-width: 2; }
 .media-player__volume { display: inline-flex; width: 34px; height: 34px; align-items: center; justify-content: center; overflow: hidden; border: 1px solid transparent; border-radius: 10px; color: var(--player-muted); cursor: pointer; transition: width .18s ease, border-color .16s ease, background .16s ease; }
-.media-player__volume:hover, .media-player__volume:focus-within { width: 126px; padding: 0 8px; border-color: var(--player-line); color: var(--player-accent-strong); background: var(--player-hover); }
+.media-player__volume:hover, .media-player__volume:focus-within, .media-player__volume.is-expanded { width: 126px; padding: 0 8px; border-color: var(--player-line); color: var(--player-accent-strong); background: var(--player-hover); }
 .media-player__volume svg { width: 18px; height: 18px; flex: none; }
 .media-player__volume input { width: 0; margin: 0; opacity: 0; accent-color: var(--player-accent); transition: width .18s ease, opacity .14s ease; }
-.media-player__volume:hover input, .media-player__volume:focus-within input { width: 78px; margin-left: 7px; opacity: 1; }
+.media-player__volume:hover input, .media-player__volume:focus-within input, .media-player__volume.is-expanded input { width: 78px; margin-left: 7px; opacity: 1; }
 
 .media-player__buttons .media-player__play {
   width: 45px;

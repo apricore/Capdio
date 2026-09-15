@@ -8,8 +8,11 @@
         content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' capdio:;"
     >
 
+    <script>
+      document.documentElement.style.setProperty('--startup-bg', localStorage.getItem('capdio-theme') === 'light' ? '#f4f6fb' : '#111827');
+    </script>
     <style>
-      html, body, #root { width: 100%; height: 100%; margin: 0; background: #111827; }
+      html, body, #root { width: 100%; height: 100%; margin: 0; background: var(--startup-bg, #111827); }
     </style>
 
     <title>Capdio</title>

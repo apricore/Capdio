@@ -9,6 +9,7 @@ const http = require('node:http');
 const os = require('node:os');
 const Busboy = require('busboy');
 const QRCode = require('qrcode');
+const { lookup, openDictionary, setDictionaryTheme } = require('./dictionary');
 
 // Register before the app is ready so Chromium treats capdio as a first-class,
 // secure URL scheme. This is required for media elements to issue range requests.
@@ -40,12 +41,15 @@ if (!hasSingleInstanceLock) {
 
 const runtimeRoot = app.isPackaged ? process.resourcesPath : __dirname;
 const platformBinaryDirectory = path.join(runtimeRoot, 'bin', `${process.platform}-${process.arch}`);
+const bundledDevelopmentPython = path.join(__dirname, '.venv-packaging', 'Scripts', 'python.exe');
+const developmentPythonExecutable = process.env.CAPDIO_PYTHON
+    || (fsSync.existsSync(bundledDevelopmentPython) ? bundledDevelopmentPython : 'python');
 const ffmpegExecutable = app.isPackaged
     ? path.join(platformBinaryDirectory, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
     : 'ffmpeg';
 const transcriberExecutable = app.isPackaged
     ? path.join(platformBinaryDirectory, 'capdio-transcribe', process.platform === 'win32' ? 'capdio-transcribe.exe' : 'capdio-transcribe')
-    : 'python';
+    : developmentPythonExecutable;
 const whisperModelDirectory = app.isPackaged ? path.join(runtimeRoot, 'models') : null;
 const defaultLibraryRoot = app.isPackaged ? path.join(app.getPath('userData'), 'library') : path.join(__dirname, 'library');
 const libraryLocationConfigPath = path.join(app.getPath('userData'), 'library-path.txt');
@@ -133,12 +137,18 @@ async function writeMetadata(id, metadata) {
 function mediaPathFor(item) { return path.join(mediaDirectory, `${item.id}${item.extension}`); }
 function captionPathFor(item) { return path.join(captionDirectory, `${item.id}.captions.json`); }
 
+const themeConfigPath = path.join(app.getPath('userData'), 'theme.json');
+let darkTheme = true;
+try {
+    darkTheme = JSON.parse(fsSync.readFileSync(themeConfigPath, 'utf8')).dark !== false;
+} catch { /* Use the default theme until the renderer supplies its preference. */ }
 function createWindow() {
     const win = new BrowserWindow({
         width: 1000,
         height: 700,
         frame: false,
-        backgroundColor: '#111827',
+        show: false,
+        backgroundColor: darkTheme ? '#111827' : '#f4f6fb',
         icon: path.join(__dirname, 'assets', 'capdio-icon.png'),
 
         webPreferences: {
@@ -152,6 +162,9 @@ function createWindow() {
     } else {
         win.loadURL('http://localhost:5173');
     }
+    win.once('ready-to-show', () => win.show());
+    win.on('focus', () => win.webContents.send('player-window-focused'));
+    win.on('blur', () => win.webContents.send('player-window-blurred'));
     win.on('close', (event) => {
         if (win.__capdioCloseAllowed) return;
         event.preventDefault();
@@ -322,6 +335,97 @@ ipcMain.handle('delete-group', async (event, groupId) => {
     return { groupId, mediaIds: removing.map((item) => item.id) };
 });
 
+function exportName(value, fallback) {
+    let name = String(value || fallback).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '') || fallback;
+    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) name = `_${name}`;
+    return name;
+}
+
+ipcMain.handle('export-group', async (event, groupId) => {
+    const manifest = await readManifest();
+    const group = manifest.groups.find((entry) => entry.id === groupId);
+    if (!group) throw new Error('The group was not found.');
+    const entries = [];
+    for (const item of manifest.media) {
+        const metadata = await readMetadata(item.id);
+        if (metadata.groupId !== groupId) continue;
+        const source = path.resolve(mediaPathFor(item));
+        const relative = path.relative(mediaDirectory, source);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Invalid media path.');
+        await fs.access(source);
+        const extension = path.extname(source);
+        let name = exportName(metadata.name, item.id);
+        if (!name.toLowerCase().endsWith(extension.toLowerCase())) name += extension;
+        entries.push({ source, name });
+    }
+    const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
+        title: `Export ${group.name} — choose destination`,
+        defaultPath: app.getPath('downloads'),
+        properties: ['openDirectory', 'createDirectory']
+    });
+    if (result.canceled || !result.filePaths.length) return null;
+    const parent = await fs.realpath(result.filePaths[0]);
+    const relative = path.relative(await fs.realpath(libraryRoot), parent);
+    if (!relative.startsWith('..') && !path.isAbsolute(relative)) {
+        throw new Error('Choose a destination outside the Capdio library.');
+    }
+    const folderName = exportName(group.name, 'Exported group');
+    let destination;
+    for (let suffix = 0; ; suffix += 1) {
+        destination = path.join(parent, suffix ? `${folderName} (${suffix})` : folderName);
+        try { await fs.mkdir(destination); break; } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+        }
+    }
+    let count = 0;
+    try {
+        for (const entry of entries) {
+            const parsed = path.parse(entry.name);
+            for (let suffix = 0; ; suffix += 1) {
+                const name = suffix ? `${parsed.name} (${suffix})${parsed.ext}` : entry.name;
+                try {
+                    await fs.copyFile(entry.source, path.join(destination, name), fsSync.constants.COPYFILE_EXCL);
+                    break;
+                } catch (error) {
+                    if (error.code !== 'EEXIST') throw error;
+                }
+            }
+            count += 1;
+        }
+    } catch (error) {
+        throw new Error(`Export stopped after ${count} of ${entries.length} files. Saved copies are in ${destination}. ${error.message}`);
+    }
+    return { destination, count };
+});
+ipcMain.handle('export-media', async (event, mediaId) => {
+    const manifest = await readManifest();
+    const item = manifest.media.find((entry) => entry.id === mediaId);
+    if (!item) throw new Error('The media item was not found.');
+    const source = path.resolve(mediaPathFor(item));
+    const relative = path.relative(mediaDirectory, source);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Invalid media path.');
+    const metadata = await readMetadata(mediaId);
+    const extension = path.extname(source);
+    let name = String(metadata.name || mediaId).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '') || mediaId;
+    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) name = `_${name}`;
+    if (!name.toLowerCase().endsWith(extension.toLowerCase())) name += extension;
+    const options = {
+        title: 'Export media',
+        defaultPath: path.join(app.getPath('downloads'), name),
+        filters: [{ name: item.type === 'audio' ? 'Audio' : 'Video', extensions: [extension.slice(1)] }]
+    };
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const result = await dialog.showSaveDialog(parent, options);
+    if (result.canceled || !result.filePath) return null;
+    // Export a copy; never overwrite files inside the managed library.
+    const destination = path.resolve(result.filePath);
+    const libraryRelative = path.relative(libraryRoot, destination);
+    if (!libraryRelative.startsWith('..') && !path.isAbsolute(libraryRelative)) {
+        throw new Error('Choose a save location outside the Capdio library.');
+    }
+    await fs.copyFile(source, destination);
+    return destination;
+});
 async function importMediaFile(sourceFile, groupId = null, originalName = path.basename(sourceFile)) {
     if (!sourceFile || typeof sourceFile !== 'string') {
         throw new Error('A media file is required.');
@@ -765,6 +869,20 @@ ipcMain.handle('cancel-transcription', async () => {
 ipcMain.handle('copy-text', (event, value) => {
     clipboard.writeText(String(value || ''));
 });
+
+ipcMain.handle('dictionary-lookup', (event, word) => lookup(word, event.sender));
+ipcMain.on('dictionary-theme', (event, dark) => {
+    darkTheme = Boolean(dark);
+    BrowserWindow.fromWebContents(event.sender)?.setBackgroundColor(darkTheme ? '#111827' : '#f4f6fb');
+    setDictionaryTheme(darkTheme);
+    try {
+        fsSync.mkdirSync(path.dirname(themeConfigPath), { recursive: true });
+        fsSync.writeFileSync(themeConfigPath, JSON.stringify({ dark: darkTheme }));
+    } catch (error) {
+        console.error('Unable to save window theme:', error);
+    }
+});
+ipcMain.handle('dictionary-open', (event) => openDictionary(event.sender));
 
 app.whenReady().then(async () => {
     if (!hasSingleInstanceLock) return;

@@ -41,15 +41,32 @@ export default function MediaPlayer({
   transcriptionProgress = 0,
   onTranscribe,
   volume = 1,
+  volumeRevealRequest = 0,
+  playbackToggleRequest = 0,
+  playbackSeekRequest = { sequence: 0, seconds: 0 },
   onVolumeChange,
   onToggleTheme,
 }) {
   const playerRef = useRef(null);
   const mediaRef = useRef(null);
   const activeRef = useRef(null);
+  const pausedForBlurRef = useRef(false);
+  const windowFocusedRef = useRef(true);
+  const windowFocusTimeRef = useRef(-Infinity);
+  const videoClickRestoresFocusRef = useRef(false);
+  const onPlayingChangeRef = useRef(onPlayingChange);
+  onPlayingChangeRef.current = onPlayingChange;
   const positionRef = useRef(0);
   const hasLoadedSourceRef = useRef(false);
   const hasRestoredPositionRef = useRef(false);
+  const handledFullscreenRequestRef = useRef(fullscreenRequest);
+  const handledVideoFullscreenRequestRef = useRef(videoFullscreenRequest);
+  const volumeRevealTimerRef = useRef(null);
+  const volumeRevealUntilRef = useRef(0);
+  const volumeHoveringRef = useRef(false);
+  const handledVolumeRevealRequestRef = useRef(volumeRevealRequest);
+  const handledPlaybackToggleRequestRef = useRef(playbackToggleRequest);
+  const handledPlaybackSeekRequestRef = useRef(playbackSeekRequest.sequence);
   const onPositionChangeRef = useRef(onPositionChange);
   onPositionChangeRef.current = onPositionChange;
   const [currentTime, setCurrentTime] = useState(0);
@@ -58,6 +75,7 @@ export default function MediaPlayer({
   const [activeIndex, setActiveIndex] = useState(-1);
   const [repeatSegment, setRepeatSegment] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [volumeExpanded, setVolumeExpanded] = useState(false);
   const [normalSplit, setNormalSplit] = useState(() => Number(localStorage.getItem('capdio-player-normal-split')) || 48);
   const [fullscreenSplit, setFullscreenSplit] = useState(() => Number(localStorage.getItem('capdio-player-fullscreen-split')) || 64);
 
@@ -68,16 +86,84 @@ export default function MediaPlayer({
   })), [captions]);
 
   useEffect(() => {
+    const media = mediaRef.current;
+    if (!media) return;
+    pausedForBlurRef.current = false;
+    const pauseForBlur = () => {
+      windowFocusedRef.current = false;
+      windowFocusTimeRef.current = -Infinity;
+      if (!media.paused && !media.ended) {
+        pausedForBlurRef.current = true;
+        media.pause();
+      }
+    };
+    const resumeAfterBlur = () => {
+      if (!windowFocusedRef.current) windowFocusTimeRef.current = performance.now();
+      windowFocusedRef.current = true;
+      if (pausedForBlurRef.current && media.paused && !media.ended) {
+        media.play().catch((error) => {
+          if (mediaRef.current !== media) return;
+          pausedForBlurRef.current = false;
+          setIsPlaying(false);
+          onPlayingChangeRef.current?.(false);
+          console.error('Unable to resume media:', error);
+        });
+      }
+    };
+    const clearBlurPause = () => { pausedForBlurRef.current = false; };
+    ipcRenderer.on('player-window-blurred', pauseForBlur);
+    ipcRenderer.on('player-window-focused', resumeAfterBlur);
+    media.addEventListener('emptied', clearBlurPause);
+    media.addEventListener('ended', clearBlurPause);
+    return () => {
+      pausedForBlurRef.current = false;
+      ipcRenderer.removeListener('player-window-blurred', pauseForBlur);
+      ipcRenderer.removeListener('player-window-focused', resumeAfterBlur);
+      media.removeEventListener('emptied', clearBlurPause);
+      media.removeEventListener('ended', clearBlurPause);
+    };
+  }, [src, mediaId, showMedia]);
+
+  useEffect(() => {
     const updateFullscreen = () => setIsFullscreen(document.fullscreenElement === playerRef.current);
     document.addEventListener('fullscreenchange', updateFullscreen);
     return () => document.removeEventListener('fullscreenchange', updateFullscreen);
   }, []);
 
+  useEffect(() => () => clearTimeout(volumeRevealTimerRef.current), []);
+
   useEffect(() => {
+    if (volumeRevealRequest === handledVolumeRevealRequestRef.current) return;
+    handledVolumeRevealRequestRef.current = volumeRevealRequest;
+    volumeRevealUntilRef.current = Date.now() + 1800;
+    setVolumeExpanded(true);
+    clearTimeout(volumeRevealTimerRef.current);
+    volumeRevealTimerRef.current = setTimeout(() => {
+      if (!volumeHoveringRef.current) setVolumeExpanded(false);
+    }, 1800);
+  }, [volumeRevealRequest]);
+
+  useEffect(() => {
+    if (playbackToggleRequest === handledPlaybackToggleRequestRef.current) return;
+    handledPlaybackToggleRequestRef.current = playbackToggleRequest;
+    togglePlayback();
+  }, [playbackToggleRequest]);
+
+  useEffect(() => {
+    if (playbackSeekRequest.sequence === handledPlaybackSeekRequestRef.current) return;
+    handledPlaybackSeekRequestRef.current = playbackSeekRequest.sequence;
+    seek(currentTime + playbackSeekRequest.seconds);
+  }, [playbackSeekRequest, currentTime]);
+
+  useEffect(() => {
+    if (fullscreenRequest === handledFullscreenRequestRef.current) return;
+    handledFullscreenRequestRef.current = fullscreenRequest;
     if (fullscreenRequest) toggleFullscreen();
   }, [fullscreenRequest]);
 
   useEffect(() => {
+    if (videoFullscreenRequest === handledVideoFullscreenRequestRef.current) return;
+    handledVideoFullscreenRequestRef.current = videoFullscreenRequest;
     if (videoFullscreenRequest && showMedia) toggleVideoFullscreen();
   }, [videoFullscreenRequest, showMedia]);
 
@@ -191,19 +277,60 @@ export default function MediaPlayer({
     selectCaption(index);
   }
 
-  function copyCaption(event, text) {
+  function lookupCaption(event, text) {
     event.preventDefault();
-    ipcRenderer.invoke('copy-text', text || '');
+    ipcRenderer.invoke('dictionary-lookup', text || '').catch((error) => {
+      window.alert(`Dictionary lookup failed: ${error.message}`);
+    });
   }
 
   function handleKeys(event) {
     if (event.target.matches('input, textarea')) return;
-    if (event.key === ' ') {
+    if (event.key === ' ' || event.key === 'Enter') {
       event.preventDefault();
-      isPlaying ? mediaRef.current?.pause() : play();
+      event.stopPropagation();
+      togglePlayback();
     }
-    if (event.key === 'ArrowLeft') seek(currentTime - 5);
-    if (event.key === 'ArrowRight') seek(currentTime + 5);
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      event.stopPropagation();
+      seek(currentTime + (event.key === 'ArrowLeft' ? -5 : 5));
+    }
+  }
+
+  function handleVideoPointerDown() {
+    // Native focus can arrive just before or after the activating pointer event.
+    videoClickRestoresFocusRef.current = !windowFocusedRef.current
+      || performance.now() - windowFocusTimeRef.current < 250;
+    windowFocusTimeRef.current = -Infinity;
+  }
+
+  function toggleVideoPlaybackOnClick() {
+    const restoresFocus = videoClickRestoresFocusRef.current;
+    videoClickRestoresFocusRef.current = false;
+    if (restoresFocus) {
+      // Focus may already have resumed playback; never toggle it off here.
+      if (mediaRef.current?.paused && !pausedForBlurRef.current) play();
+      return;
+    }
+    togglePlayback();
+  }
+
+  function togglePlayback() {
+    if (pausedForBlurRef.current) {
+      pausedForBlurRef.current = false;
+      mediaRef.current?.pause();
+      setIsPlaying(false);
+      onPlayingChange?.(false);
+      return;
+    }
+    if (mediaRef.current?.paused) play();
+    else mediaRef.current?.pause();
+  }
+
+  function handleVolumePointerLeave() {
+    volumeHoveringRef.current = false;
+    if (Date.now() >= volumeRevealUntilRef.current) setVolumeExpanded(false);
   }
 
   async function toggleFullscreen() {
@@ -244,13 +371,13 @@ export default function MediaPlayer({
 
   return (
     <section ref={playerRef} style={{ '--media-player-normal-split': `${normalSplit}%`, '--media-player-fullscreen-split': `${fullscreenSplit}%` }} className={`media-player ${!showMedia ? 'media-player--audio' : ''} ${dark ? 'media-player--dark' : ''} ${className}`} tabIndex="0" onKeyDown={handleKeys}>
-      {showMedia ? <video className="media-player__media" ref={mediaRef} src={src} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { setIsPlaying(false); onPlayingChange?.(false); }} /> : <audio ref={mediaRef} src={src} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { setIsPlaying(false); onPlayingChange?.(false); }} />}
+      {showMedia ? <video className="media-player__media" ref={mediaRef} src={src} onPointerDown={handleVideoPointerDown} onClick={toggleVideoPlaybackOnClick} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { pausedForBlurRef.current = !windowFocusedRef.current; if (pausedForBlurRef.current) mediaRef.current?.pause(); setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { if (pausedForBlurRef.current || !mediaRef.current?.paused) return; setIsPlaying(false); onPlayingChange?.(false); }} /> : <audio ref={mediaRef} src={src} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { pausedForBlurRef.current = !windowFocusedRef.current; if (pausedForBlurRef.current) mediaRef.current?.pause(); setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { if (pausedForBlurRef.current || !mediaRef.current?.paused) return; setIsPlaying(false); onPlayingChange?.(false); }} />}
 
       {showMedia && <div className="media-player__resize-handle" role="separator" aria-label="Resize video and captions" aria-orientation={isFullscreen ? 'vertical' : 'horizontal'} onPointerDown={beginResize} />}
 
       <div className="media-player__book" aria-label="Captions">
         {entries.map((entry, index) => (
-          <article key={`${entry.s}-${entry.e}-${index}`} ref={index === activeIndex ? activeRef : undefined} className={`media-player__mark ${index === activeIndex ? 'is-active' : ''}`} onClick={(event) => handleCaptionClick(event, index)} onContextMenu={(event) => copyCaption(event, entry.t)}>
+          <article key={`${entry.s}-${entry.e}-${index}`} ref={index === activeIndex ? activeRef : undefined} className={`media-player__mark ${index === activeIndex ? 'is-active' : ''}`} onClick={(event) => handleCaptionClick(event, index)} onContextMenu={(event) => lookupCaption(event, entry.t)}>
             <p>{entry.t}</p>
           </article>
         ))}
@@ -261,10 +388,10 @@ export default function MediaPlayer({
         <input className="media-player__timeline" aria-label="Playback position" type="range" min="0" max={duration || 0} step="0.01" value={Math.min(currentTime, duration || 0)} onChange={(event) => seek(Number(event.target.value))} />
         <div className="media-player__times"><span>{secondsToTimestamp(currentTime).slice(0, -2)}</span><span>{secondsToTimestamp(duration).slice(0, -2)}</span></div>
         <div className="media-player__buttons">
-          <label className="media-player__volume" title={`Volume ${Math.round(volume * 100)}%`}><Volume2 /><input aria-label="Volume" type="range" min="0" max="1" step="0.01" value={volume} onChange={(event) => onVolumeChange?.(Number(event.target.value))} /></label>
+          <label className={`media-player__volume ${volumeExpanded ? 'is-expanded' : ''}`} title={`Volume ${Math.round(volume * 100)}%`} onPointerEnter={() => { volumeHoveringRef.current = true; }} onPointerLeave={handleVolumePointerLeave}><Volume2 /><input aria-label="Volume" type="range" min="0" max="1" step="0.01" value={volume} onChange={(event) => onVolumeChange?.(Number(event.target.value))} /></label>
           <button type="button" title="Repeat active caption" aria-label="Repeat active caption" className={repeatSegment ? 'is-on' : ''} onClick={() => setRepeatSegment((value) => !value)}><Repeat2 /></button>
           <button type="button" title="Back 5 seconds" aria-label="Back 5 seconds" onClick={() => seek(currentTime - 5)}><SkipBack /></button>
-          <button type="button" className="media-player__play" aria-label={isPlaying ? 'Pause' : 'Play'} onClick={() => isPlaying ? mediaRef.current?.pause() : play()}>{isPlaying ? <Pause /> : <Play />}</button>
+          <button type="button" className="media-player__play" aria-label={isPlaying ? 'Pause' : 'Play'} onClick={togglePlayback}>{isPlaying ? <Pause /> : <Play />}</button>
           <button type="button" title="Forward 5 seconds" aria-label="Forward 5 seconds" onClick={() => seek(currentTime + 5)}><SkipForward /></button>
           <button type="button" title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'} aria-label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'} onClick={toggleFullscreen}>{isFullscreen ? <Minimize2 /> : <Maximize2 />}</button>
           <button type="button" title="Toggle colour theme" aria-label="Toggle colour theme" onClick={onToggleTheme}>{dark ? <Sun /> : <Moon />}</button>

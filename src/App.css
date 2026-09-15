@@ -108,6 +108,10 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .side-nav__items::-webkit-scrollbar-thumb { border-radius: 99px; background: rgba(203, 213, 225, .28); }
 .side-nav__group { min-height: 8px; border: 1px solid transparent; border-radius: 8px; transition: background .15s ease, border-color .15s ease; }
 .side-nav__group.is-drop-target { border-color: rgba(139, 140, 255, .72); background: rgba(100, 102, 232, .24); box-shadow: inset 0 0 0 1px rgba(139, 140, 255, .12); }
+.side-nav__group-content { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .2s ease; }
+.side-nav__group-content > div { min-height: 0; overflow: hidden; opacity: 0; transform: translateY(-4px); transition: opacity .16s ease, transform .2s ease; }
+.side-nav__group-content.is-expanded { grid-template-rows: 1fr; }
+.side-nav__group-content.is-expanded > div { opacity: 1; transform: translateY(0); }
 .side-nav__group .side-nav__item { width: calc(100% - 16px); margin-left: 16px; }
 .side-nav__group .side-nav__item::after { position: absolute; top: -5px; bottom: -5px; left: -8px; width: 1px; background: rgba(149, 166, 188, .35); content: ''; }
 .side-nav__group-name { display: flex; width: 100%; gap: 6px; align-items: center; height: 40px; border: 0; padding: 0px 6px; color: #9bacc2; background: transparent; font-size: 11px; font-weight: 750; letter-spacing: .035em; text-align: left; text-transform: uppercase; }
@@ -196,3 +200,57 @@ button:disabled { cursor: not-allowed; opacity: .52; }
   body { min-width: 0; }
   .app-shell { grid-template-columns: minmax(190px, var(--side-nav-width, 220px)) minmax(0, 1fr); }
 }
+
+/* Shared light chrome for Capdio and the dictionary title bar. */
+.app-frame:not(.app-frame--dark) {
+  color-scheme: light;
+  --chrome-text: #334155;
+  --chrome-muted: #64748b;
+  --chrome-border: #d5ddea;
+  --chrome-hover: #e4e9f4;
+}
+.app-frame--dark { color-scheme: dark; }
+.app-frame:not(.app-frame--dark) .app-menu {
+  color: var(--chrome-text);
+  background: linear-gradient(90deg, #f8faff, #edf1fa 55%, #f3f6fc);
+  border-bottom-color: var(--chrome-border);
+  box-shadow: 0 3px 14px rgba(15, 23, 42, .06);
+}
+.app-frame:not(.app-frame--dark) :is(.app-menu__items button, .app-menu__window-controls button) { color: var(--chrome-text); }
+.app-frame:not(.app-frame--dark) :is(.app-menu__items button, .app-menu__window-controls button):is(:hover, :focus-visible):not(:disabled) { color: #172033; background: var(--chrome-hover); }
+.app-frame:not(.app-frame--dark) .app-menu__window-controls .app-menu__close:hover { color: white; background: #e5484d; }
+.app-frame:not(.app-frame--dark) :is(.app-menu__popup, .context-menu, .name-dialog, .upload-dialog) { color: #172033; background: #ffffff; border-color: var(--chrome-border); box-shadow: 0 12px 36px rgba(30, 41, 59, .16); }
+.app-frame:not(.app-frame--dark) .app-menu__popup kbd { color: var(--chrome-muted); }
+.app-frame:not(.app-frame--dark) .side-nav { color: #334155; background: linear-gradient(155deg, #f8faff, #edf1f8 76%); border-right-color: var(--chrome-border); box-shadow: 8px 0 24px rgba(15, 23, 42, .04); }
+.app-frame:not(.app-frame--dark) .side-nav__header h1 { color: #172033; }
+.app-frame:not(.app-frame--dark) :is(.side-nav__header p, .side-nav__meta, .side-nav__empty, .side-nav__transcription-queued) { color: var(--chrome-muted); }
+.app-frame:not(.app-frame--dark) :is(.side-nav__name, .side-nav__group-name) { color: #475569; }
+.app-frame:not(.app-frame--dark) :is(.side-nav__count, .side-nav__group-count, .side-nav__group-name .side-nav__group-count) { color: #53617b; border-color: #d5ddea; background: #e7ecf5; }
+.app-frame:not(.app-frame--dark) .side-nav__new-group { color: #475569; border-color: var(--chrome-border); background: #ffffff80; }
+.app-frame:not(.app-frame--dark) :is(.side-nav__new-group, .side-nav__group-name, .side-nav__item):hover { color: #172033; background: var(--chrome-hover); }
+.app-frame:not(.app-frame--dark) .side-nav__item.is-selected { background: #e0e3ff; border-color: #c0c5f5; }
+.app-frame:not(.app-frame--dark) .side-nav__item.is-selected > .side-nav__name { color: #3730a3; }
+.app-frame:not(.app-frame--dark) .side-nav__item.is-selected .side-nav__meta { color: #5148a5; }
+.app-frame:not(.app-frame--dark) .side-nav__item.is-selected::before { background: #5b5ce2; box-shadow: none; }
+.app-frame:not(.app-frame--dark) .side-nav__item.is-multi-selected:not(.is-selected) { background: #eceeff; border-color: #d5d8f7; }
+.app-frame:not(.app-frame--dark) .side-nav__group.is-drop-target { border-color: #7c83e8; background: #e3e6ff; box-shadow: inset 0 0 0 1px #c5caf8; }
+.app-frame:not(.app-frame--dark) .side-nav__items.is-root-drop-target { outline-color: #7078df; background: #edf0ff; box-shadow: inset 0 0 26px rgba(99, 102, 217, .14); }
+.app-frame:not(.app-frame--dark) :is(.side-nav__folder, .side-nav__group-name.is-open .side-nav__folder) { color: #a66c12; }
+.app-frame:not(.app-frame--dark) .side-nav__media-icon { color: #6366b9; }
+.app-frame:not(.app-frame--dark) .side-nav__media-icon--audio { color: #168173; }
+.app-frame:not(.app-frame--dark) .side-nav__caption-check { color: #16835c; }
+.app-frame:not(.app-frame--dark) .side-nav__transcription-progress { color: #4338a0; background: radial-gradient(circle, #f1f4fa 57%, transparent 59%), conic-gradient(#6366d9 var(--progress), #d5ddea 0); }
+.app-frame:not(.app-frame--dark) .side-nav__items { scrollbar-color: #a8b4c8 transparent; }
+.app-frame:not(.app-frame--dark) .side-nav__items::-webkit-scrollbar-thumb { background: #a8b4c8; }
+.app-frame:not(.app-frame--dark) .context-menu button { color: #334155; }
+.app-frame:not(.app-frame--dark) .context-menu button:hover:not(:disabled) { background: #eceeff; }
+.app-frame:not(.app-frame--dark) .context-menu .context-menu__delete { color: #b42332; }
+.app-frame:not(.app-frame--dark) .context-menu .context-menu__delete:hover { color: white; background: #c7373d; }
+.app-frame:not(.app-frame--dark) :is(.name-dialog p, .upload-dialog > p, .upload-dialog__queue p) { color: #64748b; }
+.app-frame:not(.app-frame--dark) .name-dialog input { background: #f8faff; border-color: #cbd5e1; }
+.app-frame:not(.app-frame--dark) .name-dialog button:not([type="submit"]):not(.name-dialog__delete) { color: #475569; border-color: #cbd5e1; }
+.app-frame:not(.app-frame--dark) :is(.upload-dialog code, .upload-dialog__queue div span:last-child) { color: #5148b8; }
+.app-frame:not(.app-frame--dark) :is(.upload-dialog__copy, .upload-dialog__close) { color: #475569; }
+.app-frame:not(.app-frame--dark) :is(.upload-dialog__copy, .upload-dialog__close):hover { background: #e4e9f4; color: #172033; }
+.app-frame:not(.app-frame--dark) .upload-dialog__cancel { color: #b42332; }
+.app-frame:not(.app-frame--dark) .upload-dialog__cancel:hover { color: white; }
