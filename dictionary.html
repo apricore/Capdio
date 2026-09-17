@@ -28,6 +28,13 @@ body { min-width: 0; background: var(--app-bg); }
 </header>
 <script>
 const { ipcRenderer } = require('electron');
+let wasBlurred = false;
+window.addEventListener('blur', () => { wasBlurred = true; });
+window.addEventListener('focus', () => {
+  if (wasBlurred) document.body.classList.add('window-control-hover-suppressed');
+  wasBlurred = false;
+});
+window.addEventListener('pointermove', () => document.body.classList.remove('window-control-hover-suppressed'));
 ipcRenderer.on('dictionary-theme', (event, dark) => {
     document.body.classList.toggle('app-frame--dark', dark);
 });

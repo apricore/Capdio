@@ -870,7 +870,7 @@ ipcMain.handle('copy-text', (event, value) => {
     clipboard.writeText(String(value || ''));
 });
 
-ipcMain.handle('dictionary-lookup', (event, word) => lookup(word, event.sender));
+ipcMain.handle('dictionary-lookup', (event, word) => lookup(word, event.sender, { clearHistory: true }));
 ipcMain.on('dictionary-theme', (event, dark) => {
     darkTheme = Boolean(dark);
     BrowserWindow.fromWebContents(event.sender)?.setBackgroundColor(darkTheme ? '#111827' : '#f4f6fb');

@@ -219,6 +219,8 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .app-frame:not(.app-frame--dark) :is(.app-menu__items button, .app-menu__window-controls button) { color: var(--chrome-text); }
 .app-frame:not(.app-frame--dark) :is(.app-menu__items button, .app-menu__window-controls button):is(:hover, :focus-visible):not(:disabled) { color: #172033; background: var(--chrome-hover); }
 .app-frame:not(.app-frame--dark) .app-menu__window-controls .app-menu__close:hover { color: white; background: #e5484d; }
+.app-frame.window-control-hover-suppressed .app-menu__window-controls button:hover { color: #b9c6d8; background: transparent; }
+.app-frame.window-control-hover-suppressed:not(.app-frame--dark) .app-menu__window-controls button:hover { color: var(--chrome-text); background: transparent; }
 .app-frame:not(.app-frame--dark) :is(.app-menu__popup, .context-menu, .name-dialog, .upload-dialog) { color: #172033; background: #ffffff; border-color: var(--chrome-border); box-shadow: 0 12px 36px rgba(30, 41, 59, .16); }
 .app-frame:not(.app-frame--dark) .app-menu__popup kbd { color: var(--chrome-muted); }
 .app-frame:not(.app-frame--dark) .side-nav { color: #334155; background: linear-gradient(155deg, #f8faff, #edf1f8 76%); border-right-color: var(--chrome-border); box-shadow: 8px 0 24px rgba(15, 23, 42, .04); }

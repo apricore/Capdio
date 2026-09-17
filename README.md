@@ -4,6 +4,11 @@ Capdio is a desktop audio/video library for listening, reading synchronized capt
 
 Built with Electron, React, Vite, OpenAI Whisper, and FFmpeg. The included installer pipeline targets **Windows x64**.
 
+<p align="center">
+  <img src="assets/app-window-screenshot-lighttheme.png" alt="Capdio light theme" width="49%">
+  <img src="assets/app-window-screenshot-darktheme.png" alt="Capdio dark theme" width="49%">
+</p>
+
 ## Features
 
 - **Media library:** import multiple files, organize them into groups, rename entries, and move selected media by dragging it between groups or into the ungrouped area.
@@ -119,13 +124,14 @@ Back up the entire library directory to preserve media and its associated captio
 ### Requirements
 
 - Node.js 22.12 or newer and npm, as used by the project's build setup.
+- Python 3.13 x64 for the local Whisper runtime and Windows packaging.
 - Python with `openai-whisper` installed, available as `python` on `PATH`.
 - FFmpeg available as `ffmpeg` on `PATH` for development transcription.
 
 Install dependencies:
 
 ```powershell
-npm install
+npm ci
 python -m pip install openai-whisper
 ```
 
@@ -145,9 +151,26 @@ Development Electron loads `http://localhost:5173`, so keep Vite running. `npm r
 
 ## Build a Windows installer
 
-Create an isolated Python 3.13 packaging environment:
+Before building a Windows installer, start the development app once to let
+Electron finish setting up its local runtime files. Run these commands from
+the project directory in separate terminals:
 
 ```powershell
+npm run dev
+npm start
+```
+
+Stop both processes after the app opens, then create the packaging environment
+and build the installer as described below.
+
+From a fresh clone, create an isolated Python 3.13 packaging environment.
+The Python requirements install cx_Freeze, Whisper, and Torch; no Python
+packages from the global interpreter are used:
+
+```powershell
+git clone <repository-url>
+cd Capdio
+npm ci
 py -3.13 -m venv .venv-packaging
 .\.venv-packaging\Scripts\python -m pip install --upgrade pip
 .\.venv-packaging\Scripts\python -m pip install -r python\requirements-build.txt
@@ -155,7 +178,7 @@ $env:CAPDIO_PYTHON = (Resolve-Path .\.venv-packaging\Scripts\python.exe)
 npm run dist:win
 ```
 
-Set `CAPDIO_PYTHON` again in each new terminal used for packaging. The complete build compiles the renderer, freezes the Python transcriber, stages the Whisper `base` model, bundles FFmpeg, and produces:
+Set `CAPDIO_PYTHON` again in each new terminal used for packaging. The complete build compiles the renderer, bundles the Python transcriber with cx_Freeze, stages the Whisper `base` model, bundles FFmpeg, and produces:
 
 ```text
 release/Capdio Setup <version>.exe
@@ -174,7 +197,7 @@ After Python changes, run the full `npm run dist:win` build. See [PACKAGING.md](
 | `npm run dev` | Start the Vite development server |
 | `npm start` | Start Electron |
 | `npm run build` | Build the React renderer |
-| `npm run build:python` | Freeze the Python transcriber |
+| `npm run build:python` | Bundle the Python transcriber with cx_Freeze |
 | `npm run download:model` | Stage the Whisper model |
 | `npm run package:resources` | Build the transcriber and stage the model |
 | `npm run dist:win` | Build the complete Windows installer |

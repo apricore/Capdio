@@ -39,7 +39,7 @@ function applyDictionaryAppearance() {
     const contents = dictionaryContents;
     if (!contents || contents.isDestroyed()) return;
     dictionaryView.setBackgroundColor(darkTheme ? '#111111' : '#ffffff');
-    const css = '.top-banner-wrap { display: none !important; }\n' + (darkTheme ? dictionaryDarkCSS : '');
+    const css = '.top-banner-wrap { display: none !important; }\na[href] { pointer-events: none !important; cursor: default !important; }\n' + (darkTheme ? dictionaryDarkCSS : '');
     return contents.executeJavaScript(`(() => {
         let style = document.getElementById('capdio-dictionary-style');
         if (!style) {
@@ -55,13 +55,42 @@ function applyDictionaryAppearance() {
         if (!contents.isDestroyed()) console.error('Unable to apply dictionary appearance:', error);
     });
 }
-function disableMouseOverAutoPronounce() {
+function injectScript() {
     const contents = dictionaryContents;
     if (!contents || contents.isDestroyed()) return;
     contents.executeJavaScript(`(() => {
+        // for disabling mouseover auto pronounce
         document.addEventListener("mouseover", (event) => {
             if (event.target.closest(".pronounce")) {
                 event.stopPropagation()
+            }
+        }, true);
+        // Shortcuts:
+        document.addEventListener("keydown", (event) => {
+            if (event.ctrlKey) {
+                if (event.key === "a") { // Ctrl-A to focus and select the search input instead of select all
+                    event.preventDefault();
+                    const search_input = document.getElementById("search_input");
+                    search_input.select();
+                    search_input.focus();
+                }
+            } else if (event.altKey) {
+                if (event.key === "ArrowUp") { // Ctrl-ArrowUp to move to the previous tab
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                    document.querySelector(".tabs")?.querySelector(".active")?.previousElementSibling?.click();
+                } else if (event.key === "ArrowDown") { // Ctrl-ArrowUp to move to the next tab
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                    document.querySelector(".tabs")?.querySelector(".active")?.nextElementSibling?.click();
+                }
+            } else {
+                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                    if (!document.querySelector("#autosuggest-autosuggest__results").querySelector(".autosuggest__results") && document.activeElement.id === "search_input") {
+                        event.stopImmediatePropagation();
+                        document.getElementById("search_input").blur();
+                    }
+                }
             }
         }, true);
     })()`)
@@ -90,7 +119,7 @@ ipcMain.on('dictionary-control', (event, action) => {
     if (action === 'maximize') win.isMaximized() ? win.unmaximize() : win.maximize();
     if (action === 'close') win.close();
 });
-async function showDictionary(word, sender) {
+async function showDictionary(word, sender, clearHistory = false) {
     if (sender) lookupSender = sender;
 
     if (!youdaoWindow || youdaoWindow.isDestroyed()) {
@@ -125,7 +154,7 @@ async function showDictionary(word, sender) {
         });
         contents.on('dom-ready', async () => {
             const version = navigationVersion;
-            disableMouseOverAutoPronounce();
+            injectScript();
             await applyDictionaryAppearance();
             if (!contents.isDestroyed() && version === navigationVersion) {
                 view.setVisible(true);
@@ -239,14 +268,15 @@ async function showDictionary(word, sender) {
         const win = youdaoWindow;
         await pageReady;
         if (win.isDestroyed()) return;
-        // A caption lookup is a user action; keep its history entry traversable.
+        if (clearHistory) dictionaryContents.navigationHistory.clear();
+        // IPC lookups replace the current entry; Youdao Ctrl+S lookups remain traversable.
         await dictionaryContents.executeJavaScript(`(() => {
             const word = ${JSON.stringify(word)};
             const url = new URL(location.href);
             url.pathname = '/result';
             url.searchParams.set('word', word);
             url.searchParams.set('lang', 'en');
-            history.pushState({ word }, '', url);
+            history.${clearHistory ? 'replaceState' : 'pushState'}({ word }, '', url);
             window.dispatchEvent(new PopStateEvent('popstate', { state: { word } }));
         })()`, true);
         if (!win.isDestroyed() && dictionaryContents && !dictionaryContents.isDestroyed()) {
@@ -265,9 +295,9 @@ async function showDictionary(word, sender) {
     }
 }
 
-function lookup(word, sender) {
+function lookup(word, sender, options = {}) {
     if (typeof word !== 'string' || !word.trim()) return;
-    return showDictionary(word.trim(), sender);
+    return showDictionary(word.trim(), sender, options.clearHistory === true);
 }
 
 function openDictionary(sender) {

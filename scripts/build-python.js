@@ -1,27 +1,19 @@
 const { execFileSync } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
 const python = process.env.CAPDIO_PYTHON || 'python';
 const target = `${process.platform}-${process.arch}`;
-const output = path.join(root, 'resources', 'bin', target);
-const build = path.join(root, 'build', 'pyinstaller');
+const outputRoot = path.join(root, 'resources', 'bin', target);
+const output = path.join(outputRoot, 'capdio-transcribe');
+const build = path.join(root, 'build', 'cx-freeze');
+
+fs.rmSync(outputRoot, { recursive: true, force: true });
+fs.rmSync(build, { recursive: true, force: true });
 
 execFileSync(python, [
-  '-m', 'PyInstaller',
-  '--noconfirm',
-  '--clean',
-  '--onedir',
-  '--name', 'capdio-transcribe',
-  '--distpath', output,
-  '--workpath', build,
-  '--specpath', build,
-  '--collect-data', 'whisper',
-  '--collect-data', 'tiktoken',
-  '--collect-binaries', 'tiktoken',
-  '--exclude-module', 'PyQt5',
-  '--exclude-module', 'PyQt6',
-  '--exclude-module', 'PySide2',
-  '--exclude-module', 'PySide6',
-  path.join(root, 'python', 'transcribe.py')
+  path.join(root, 'python', 'setup.py'),
+  'build_exe',
+  `--build-exe=${output}`
 ], { cwd: root, stdio: 'inherit' });

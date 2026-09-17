@@ -5,6 +5,13 @@ import capdioIcon from '../assets/capdio-icon.png';
 
 const { ipcRenderer } = window.require('electron');
 
+function timestampToSeconds(value) {
+  if (typeof value === 'number') return value;
+  const parts = String(value ?? '').split(':').map(Number);
+  if (parts.length !== 3 || parts.some(Number.isNaN)) return 0;
+  return parts[0] * 60 + parts[1] + parts[2] / 10;
+}
+
 function App() {
   const [library, setLibrary] = useState([]);
   const [groups, setGroups] = useState([]);
@@ -28,6 +35,24 @@ function App() {
   const [transcribingMediaId, setTranscribingMediaId] = useState(null);
   const [queuedTranscriptionIds, setQueuedTranscriptionIds] = useState(new Set());
   const [darkTheme, setDarkTheme] = useState(() => localStorage.getItem('capdio-theme') !== 'light');
+  const [suppressWindowControlHover, setSuppressWindowControlHover] = useState(false);
+  useEffect(() => {
+    let wasBlurred = false;
+    const handleBlur = () => { wasBlurred = true; };
+    const handleFocus = () => {
+      if (wasBlurred) setSuppressWindowControlHover(true);
+      wasBlurred = false;
+    };
+    const clearHoverSuppression = () => setSuppressWindowControlHover(false);
+    ipcRenderer.on('player-window-blurred', handleBlur);
+    ipcRenderer.on('player-window-focused', handleFocus);
+    window.addEventListener('pointermove', clearHoverSuppression);
+    return () => {
+      ipcRenderer.removeListener('player-window-blurred', handleBlur);
+      ipcRenderer.removeListener('player-window-focused', handleFocus);
+      window.removeEventListener('pointermove', clearHoverSuppression);
+    };
+  }, []);
   useEffect(() => {
     const receiveTheme = (_event, dark) => setDarkTheme(dark);
     ipcRenderer.on('dictionary-theme-changed', receiveTheme);
@@ -134,6 +159,20 @@ function App() {
       }
       const target = event.target;
       const isEditingText = target instanceof HTMLElement && (target.matches('input, textarea, [contenteditable="true"]') || target.isContentEditable);
+      if (media && !isEditingText && event.key === 's' && !event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey) {
+        const currentCaption = captions.find((caption) => {
+          const start = timestampToSeconds(caption.s ?? caption.start);
+          const end = timestampToSeconds(caption.e ?? caption.end);
+          return currentPositionRef.current >= start && currentPositionRef.current < end;
+        });
+        if (currentCaption) {
+          event.preventDefault();
+          event.stopPropagation();
+          ipcRenderer.invoke('dictionary-lookup', currentCaption.t || '').catch((error) => {
+            window.alert(`Dictionary lookup failed: ${error.message}`);
+          });
+        }
+      }
       if (media && !isEditingText && !event.ctrlKey && !event.altKey && !event.metaKey && (event.key === ' ' || event.key === 'Enter')) {
         event.preventDefault();
         setPlaybackToggleRequest((value) => value + 1);
@@ -160,7 +199,7 @@ function App() {
     };
     window.addEventListener('keydown', handleWindowShortcuts);
     return () => window.removeEventListener('keydown', handleWindowShortcuts);
-  }, [media, isImporting]);
+  }, [media, isImporting, captions]);
 
   useEffect(() => {
     const blurNonTextControls = (event) => {
@@ -343,8 +382,9 @@ function App() {
       setStatus('Writing caption JSON and manifest...');
       const saved = await ipcRenderer.invoke('save-transcription', item.id, result);
       const updatedItem = { ...item, caption: saved.captionRelativePath, captions: saved.caption.captions };
-      if (media?.id === item.id) {
-        setMedia(updatedItem);
+      if (activeMediaRef.current?.id === item.id) {
+        activeMediaRef.current = { ...activeMediaRef.current, ...updatedItem };
+        setMedia((current) => current?.id === item.id ? { ...current, ...updatedItem } : current);
         setCaptions(saved.caption.captions);
       }
       setLibrary((items) => items.map((entry) => entry.id === item.id ? updatedItem : entry));
@@ -619,7 +659,7 @@ function App() {
   }
 
   return (
-    <main className={`app-frame ${darkTheme ? 'app-frame--dark' : ''}`} onClick={() => { setContextMenu(null); setAppMenu(null); }}>
+    <main className={`app-frame ${darkTheme ? 'app-frame--dark' : ''} ${suppressWindowControlHover ? 'window-control-hover-suppressed' : ''}`} onClick={() => { setContextMenu(null); setAppMenu(null); }}>
       <header className="app-menu" aria-label="Application menu">
         <div className="app-menu__brand"><img src={capdioIcon} alt="Capdio" draggable="false" /></div>
         <nav className="app-menu__items" aria-label="Main menu" onClick={(event) => event.stopPropagation()}>
