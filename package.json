@@ -9,7 +9,8 @@
     "build": "vite build",
     "build:python": "node scripts/build-python.js",
     "download:model": "node scripts/download-model.js",
-    "package:resources": "npm run build:python && npm run download:model",
+    "download:yt-dlp": "node scripts/download-yt-dlp.js",
+    "package:resources": "npm run build:python && npm run download:model && npm run download:yt-dlp",
     "dist:win": "npm run build && npm run package:resources && electron-builder --win nsis",
     "repackage:win": "npm run build && electron-builder --win nsis"
   },

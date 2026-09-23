@@ -33,6 +33,7 @@ export default function MediaPlayer({
   className = '',
   dark = false,
   showMedia = false,
+  playInBackground = false,
   fullscreenRequest = 0,
   videoFullscreenRequest = 0,
   hasCaptions = false,
@@ -41,10 +42,12 @@ export default function MediaPlayer({
   transcriptionProgress = 0,
   onTranscribe,
   volume = 1,
+  loop = false,
   volumeRevealRequest = 0,
   playbackToggleRequest = 0,
   playbackSeekRequest = { sequence: 0, seconds: 0 },
   onVolumeChange,
+  onLoopChange,
   onToggleTheme,
 }) {
   const playerRef = useRef(null);
@@ -52,6 +55,8 @@ export default function MediaPlayer({
   const activeRef = useRef(null);
   const pausedForBlurRef = useRef(false);
   const windowFocusedRef = useRef(true);
+  const playInBackgroundRef = useRef(playInBackground);
+  playInBackgroundRef.current = playInBackground;
   const windowFocusTimeRef = useRef(-Infinity);
   const videoClickRestoresFocusRef = useRef(false);
   const onPlayingChangeRef = useRef(onPlayingChange);
@@ -73,7 +78,7 @@ export default function MediaPlayer({
   const [duration, setDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
-  const [repeatSegment, setRepeatSegment] = useState(false);
+  const [loopEnabled, setLoopEnabled] = useState(loop);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [volumeExpanded, setVolumeExpanded] = useState(false);
   const [normalSplit, setNormalSplit] = useState(() => Number(localStorage.getItem('capdio-player-normal-split')) || 48);
@@ -92,6 +97,7 @@ export default function MediaPlayer({
     const pauseForBlur = () => {
       windowFocusedRef.current = false;
       windowFocusTimeRef.current = -Infinity;
+      if (playInBackgroundRef.current) return;
       if (!media.paused && !media.ended) {
         pausedForBlurRef.current = true;
         media.pause();
@@ -208,12 +214,6 @@ export default function MediaPlayer({
     setCurrentTime(time);
     positionRef.current = time;
     onCurrentPosition?.(mediaId, time);
-    const repeatingEntry = entries[activeIndex];
-    if (repeatSegment && repeatingEntry && time >= repeatingEntry.end - 0.03) {
-      media.currentTime = repeatingEntry.start;
-      setCurrentTime(repeatingEntry.start);
-      return;
-    }
     const index = activeAt(time);
     setActiveIndex(index);
   }
@@ -371,7 +371,7 @@ export default function MediaPlayer({
 
   return (
     <section ref={playerRef} style={{ '--media-player-normal-split': `${normalSplit}%`, '--media-player-fullscreen-split': `${fullscreenSplit}%` }} className={`media-player ${!showMedia ? 'media-player--audio' : ''} ${dark ? 'media-player--dark' : ''} ${className}`} tabIndex="0" onKeyDown={handleKeys}>
-      {showMedia ? <video className="media-player__media" ref={mediaRef} src={src} onPointerDown={handleVideoPointerDown} onClick={toggleVideoPlaybackOnClick} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { pausedForBlurRef.current = !windowFocusedRef.current; if (pausedForBlurRef.current) mediaRef.current?.pause(); setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { if (pausedForBlurRef.current || !mediaRef.current?.paused) return; setIsPlaying(false); onPlayingChange?.(false); }} /> : <audio ref={mediaRef} src={src} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { pausedForBlurRef.current = !windowFocusedRef.current; if (pausedForBlurRef.current) mediaRef.current?.pause(); setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { if (pausedForBlurRef.current || !mediaRef.current?.paused) return; setIsPlaying(false); onPlayingChange?.(false); }} />}
+      {showMedia ? <video className="media-player__media" ref={mediaRef} src={src} loop={loopEnabled} onPointerDown={handleVideoPointerDown} onClick={toggleVideoPlaybackOnClick} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { pausedForBlurRef.current = !windowFocusedRef.current && !playInBackgroundRef.current; if (pausedForBlurRef.current) mediaRef.current?.pause(); setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { if (pausedForBlurRef.current || !mediaRef.current?.paused) return; setIsPlaying(false); onPlayingChange?.(false); }} /> : <audio ref={mediaRef} src={src} loop={loopEnabled} onTimeUpdate={updateTime} onLoadedMetadata={handleLoadedMetadata} onCanPlay={handleCanPlay} onPlay={() => { pausedForBlurRef.current = !windowFocusedRef.current && !playInBackgroundRef.current; if (pausedForBlurRef.current) mediaRef.current?.pause(); setIsPlaying(true); onPlayingChange?.(true); }} onPause={() => { if (pausedForBlurRef.current || !mediaRef.current?.paused) return; setIsPlaying(false); onPlayingChange?.(false); }} />}
 
       {showMedia && <div className="media-player__resize-handle" role="separator" aria-label="Resize video and captions" aria-orientation={isFullscreen ? 'vertical' : 'horizontal'} onPointerDown={beginResize} />}
 
@@ -389,7 +389,7 @@ export default function MediaPlayer({
         <div className="media-player__times"><span>{secondsToTimestamp(currentTime).slice(0, -2)}</span><span>{secondsToTimestamp(duration).slice(0, -2)}</span></div>
         <div className="media-player__buttons">
           <label className={`media-player__volume ${volumeExpanded ? 'is-expanded' : ''}`} title={`Volume ${Math.round(volume * 100)}%`} onPointerEnter={() => { volumeHoveringRef.current = true; }} onPointerLeave={handleVolumePointerLeave}><Volume2 /><input aria-label="Volume" type="range" min="0" max="1" step="0.01" value={volume} onChange={(event) => onVolumeChange?.(Number(event.target.value))} /></label>
-          <button type="button" title="Repeat active caption" aria-label="Repeat active caption" className={repeatSegment ? 'is-on' : ''} onClick={() => setRepeatSegment((value) => !value)}><Repeat2 /></button>
+          <button type="button" title="Loop media" aria-label="Loop media" aria-pressed={loopEnabled} className={loopEnabled ? 'is-on' : ''} onClick={() => { const next = !loopEnabled; setLoopEnabled(next); onLoopChange?.(next); }}><Repeat2 /></button>
           <button type="button" title="Back 5 seconds" aria-label="Back 5 seconds" onClick={() => seek(currentTime - 5)}><SkipBack /></button>
           <button type="button" className="media-player__play" aria-label={isPlaying ? 'Pause' : 'Play'} onClick={togglePlayback}>{isPlaying ? <Pause /> : <Play />}</button>
           <button type="button" title="Forward 5 seconds" aria-label="Forward 5 seconds" onClick={() => seek(currentTime + 5)}><SkipForward /></button>

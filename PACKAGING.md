@@ -42,6 +42,7 @@ The generated runtime resources are intentionally ignored by Git:
 
 - `resources/bin/win32-x64/capdio-transcribe/` — Python, Torch, and Whisper
 - `resources/bin/win32-x64/ffmpeg.exe` — FFmpeg is sourced from `ffmpeg-static`
+- `resources/bin/win32-x64/yt-dlp.exe` — staged from the official yt-dlp release by `npm run download:yt-dlp`
 - `resources/models/base.pt` — Whisper model
 
 The build regenerates all ignored packaging resources, so a fresh clone does

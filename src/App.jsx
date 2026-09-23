@@ -21,6 +21,7 @@ function App() {
   const [nameDialog, setNameDialog] = useState(null);
   const [deleteDialog, setDeleteDialog] = useState(null);
   const [uploadSession, setUploadSession] = useState(null);
+  const [urlDialog, setUrlDialog] = useState(null);
   const [uploads, setUploads] = useState([]);
   const [uploadQueueSize, setUploadQueueSize] = useState(0);
   const [inlineRename, setInlineRename] = useState(null);
@@ -35,7 +36,11 @@ function App() {
   const [transcribingMediaId, setTranscribingMediaId] = useState(null);
   const [queuedTranscriptionIds, setQueuedTranscriptionIds] = useState(new Set());
   const [darkTheme, setDarkTheme] = useState(() => localStorage.getItem('capdio-theme') !== 'light');
+  const [playMediaInBackground, setPlayMediaInBackground] = useState(() => localStorage.getItem('capdio-play-media-in-background') === 'true');
   const [suppressWindowControlHover, setSuppressWindowControlHover] = useState(false);
+  useEffect(() => {
+    localStorage.setItem('capdio-play-media-in-background', String(playMediaInBackground));
+  }, [playMediaInBackground]);
   useEffect(() => {
     let wasBlurred = false;
     const handleBlur = () => { wasBlurred = true; };
@@ -74,8 +79,17 @@ function App() {
   const positionSaveTimersRef = useRef(new Map());
   const currentPositionRef = useRef(0);
   const activeMediaRef = useRef(null);
+  const deletedMediaIdsRef = useRef(new Set());
+  const urlDialogSnapshotRef = useRef(null);
+  const urlInputRef = useRef(null);
 
   useEffect(() => { activeMediaRef.current = media; }, [media]);
+
+  useEffect(() => {
+    // Visibility and state are separate: hiding the URL dialog must not throw
+    // away a completed discovery list or the user's checked selections.
+    if (urlDialog && !urlDialog.downloading) urlDialogSnapshotRef.current = urlDialog;
+  }, [urlDialog]);
 
   useEffect(() => {
     const saveBeforeClose = () => {
@@ -226,6 +240,7 @@ function App() {
     if (!targetMedia) return;
     const volume = Math.max(0, Math.min(1, Number(value)));
     const mediaId = targetMedia.id;
+    if (deletedMediaIdsRef.current.has(mediaId)) return;
     const updated = { ...targetMedia, volume };
     if (activeMediaRef.current?.id === mediaId) activeMediaRef.current = updated;
     setMedia(updated);
@@ -247,14 +262,29 @@ function App() {
     setVolumeRevealRequest((value) => value + 1);
   }
 
+  function saveMediaLoop(value, targetMedia = activeMediaRef.current) {
+    if (!targetMedia || deletedMediaIdsRef.current.has(targetMedia.id)) return;
+    const loop = Boolean(value);
+    const updated = { ...targetMedia, loop };
+    if (activeMediaRef.current?.id === targetMedia.id) activeMediaRef.current = updated;
+    setMedia((current) => current?.id === targetMedia.id ? { ...current, loop } : current);
+    setLibrary((items) => items.map((item) => item.id === targetMedia.id ? { ...item, loop } : item));
+    ipcRenderer.invoke('set-media-loop', targetMedia.id, loop).catch((error) => {
+      setStatus(`Could not save loop setting: ${error.message}`);
+    });
+  }
+
   function selectMedia(item, event) {
     const isMultiSelect = event?.ctrlKey || event?.metaKey;
     setSelectedIds((current) => {
-      if (!isMultiSelect) return new Set([item.id]);
+      if (!isMultiSelect) return new Set();
       const next = new Set(current);
       next.has(item.id) ? next.delete(item.id) : next.add(item.id);
       return next;
     });
+    // Ctrl/Cmd-click only changes the multi-selection. It must not replace the
+    // media currently loaded in the player.
+    if (isMultiSelect) return;
     if (media && media.id !== item.id) {
       saveMediaPosition(media.id, currentPositionRef.current, true);
     }
@@ -297,13 +327,35 @@ function App() {
       });
       if (update.state === 'complete' && update.item) setLibrary((items) => [...items, { ...update.item, captions: [] }]);
     };
+    const onUrlDownloadStatus = (_event, message) => {
+      setStatus(message);
+      setUrlDialog((dialog) => dialog?.downloading ? { ...dialog, progressMessage: message } : dialog);
+    };
+    const onUrlDownloadImported = (_event, item) => {
+      const imported = { ...item, captions: [] };
+      setLibrary((items) => items.some((entry) => entry.id === imported.id) ? items : [...items, imported]);
+    };
+    const onUrlDownloadItemStatus = (_event, update) => {
+      const applyUpdate = (dialog) => dialog?.available ? {
+        ...dialog,
+        available: dialog.available.map((item) => item.url === update.url ? { ...item, state: update.state, error: update.error || '' } : item)
+      } : dialog;
+      urlDialogSnapshotRef.current = applyUpdate(urlDialogSnapshotRef.current);
+      setUrlDialog((dialog) => dialog ? applyUpdate(dialog) : dialog);
+    };
     ipcRenderer.on('transcription-progress', onProgress);
     ipcRenderer.on('transcription-status', onStatus);
     ipcRenderer.on('upload-status', onUploadStatus);
+    ipcRenderer.on('url-download-status', onUrlDownloadStatus);
+    ipcRenderer.on('url-download-imported', onUrlDownloadImported);
+    ipcRenderer.on('url-download-item-status', onUrlDownloadItemStatus);
     return () => {
       ipcRenderer.removeListener('transcription-progress', onProgress);
       ipcRenderer.removeListener('transcription-status', onStatus);
       ipcRenderer.removeListener('upload-status', onUploadStatus);
+      ipcRenderer.removeListener('url-download-status', onUrlDownloadStatus);
+      ipcRenderer.removeListener('url-download-imported', onUrlDownloadImported);
+      ipcRenderer.removeListener('url-download-item-status', onUrlDownloadItemStatus);
     };
   }, []);
 
@@ -318,8 +370,100 @@ function App() {
     }
   }
 
+  async function downloadFromUrl(event) {
+    event.preventDefault();
+    const url = urlDialog?.url?.trim();
+    if (!url || urlDialog.downloading) return;
+    if (!urlDialog.available) {
+      setUrlDialog((dialog) => ({ ...dialog, downloading: true, progressMessage: 'Inspecting webpage…', error: '' }));
+      try {
+        const discovery = await ipcRenderer.invoke('discover-url-media', url);
+        if (discovery.error) {
+          const failedState = { ...(urlDialogSnapshotRef.current || {}), url, downloading: false, error: discovery.error };
+          urlDialogSnapshotRef.current = failedState;
+          setUrlDialog((dialog) => dialog ? { ...dialog, ...failedState } : dialog);
+          setStatus(`Media detection failed: ${discovery.error}`);
+          return;
+        }
+        if (discovery.cancelled) {
+          setUrlDialog((dialog) => dialog ? { ...dialog, downloading: false, progressMessage: '', error: '' } : dialog);
+          setStatus('Media detection cancelled.');
+          return;
+        }
+        const available = discovery.available;
+        const detectedState = {
+          ...(urlDialogSnapshotRef.current || {}),
+          url,
+          downloading: false,
+          error: '',
+          available: available.map((item) => ({ ...item, state: 'idle' })),
+          selectedUrls: available.map((item) => item.url),
+          progressMessage: ''
+        };
+        urlDialogSnapshotRef.current = detectedState;
+        setUrlDialog((dialog) => dialog ? { ...dialog, ...detectedState } : dialog);
+        setStatus(`Found ${available.length} available media source${available.length === 1 ? '' : 's'}.`);
+      } catch (error) {
+        const failedState = { ...(urlDialogSnapshotRef.current || {}), url, downloading: false, error: error.message };
+        urlDialogSnapshotRef.current = failedState;
+        setUrlDialog((dialog) => dialog ? { ...dialog, ...failedState } : dialog);
+        setStatus(`Media detection failed: ${error.message}`);
+      }
+      return;
+    }
+    const selectedUrls = urlDialog.selectedUrls.filter((selectedUrl) => urlDialog.available.some((item) => item.url === selectedUrl && item.state !== 'downloaded'));
+    if (!selectedUrls.length) {
+      setUrlDialog((dialog) => ({ ...dialog, error: 'Select at least one media item.' }));
+      return;
+    }
+    setUrlDialog((dialog) => ({ ...dialog, downloading: true, progressMessage: 'Preparing download…', error: '' }));
+    setStatus('Preparing URL download…');
+    try {
+      const result = await ipcRenderer.invoke('download-from-url', url, selectedUrls);
+      const imported = (result.items || []).map((item) => ({ ...item, captions: [] }));
+      setLibrary((items) => [...items, ...imported.filter((item) => !items.some((entry) => entry.id === item.id))]);
+      if (imported[0]) selectMedia(imported[0]);
+      const failureMessage = result.failures?.length
+        ? `${result.failures.length} media item${result.failures.length === 1 ? '' : 's'} failed: ${result.failures[0].error}`
+        : '';
+      const finishDialog = (dialog) => dialog ? { ...dialog, downloading: false, progressMessage: '', error: failureMessage } : dialog;
+      urlDialogSnapshotRef.current = finishDialog(urlDialogSnapshotRef.current);
+      setUrlDialog(finishDialog);
+      setStatus(result.cancelled
+        ? `Download cancelled. Kept ${imported.length} completed media item${imported.length === 1 ? '' : 's'}.`
+        : failureMessage || `Downloaded ${imported.length} media item${imported.length === 1 ? '' : 's'}.`);
+    } catch (error) {
+      setUrlDialog((dialog) => dialog ? { ...dialog, downloading: false, error: error.message } : dialog);
+      setStatus(`URL download failed: ${error.message}`);
+    }
+  }
+
+  async function openUrlDownloadDialog() {
+    const active = await ipcRenderer.invoke('get-url-download-state');
+    setUrlDialog(active?.running
+      ? { ...(urlDialogSnapshotRef.current || {}), url: active.url, downloading: true, error: '', progressMessage: active.progressMessage }
+      : urlDialogSnapshotRef.current || { url: '', downloading: false, error: '', available: null, selectedUrls: [] });
+    setAppMenu(null);
+  }
+
+  function changeDownloadUrl() {
+    setUrlDialog((dialog) => ({ ...dialog, available: null, selectedUrls: [], error: '' }));
+    requestAnimationFrame(() => {
+      urlInputRef.current?.focus();
+      urlInputRef.current?.select();
+    });
+  }
+
+  async function cancelUrlDownload() {
+    const cancelled = await ipcRenderer.invoke('cancel-url-download');
+    if (cancelled) {
+      setUrlDialog((dialog) => dialog ? { ...dialog, progressMessage: 'Cancelling download…' } : dialog);
+      setStatus('Cancelling URL download…');
+    }
+  }
+
   function saveMediaPosition(mediaId, value, immediately = false) {
-    if (!mediaId) return;
+    if (!mediaId || deletedMediaIdsRef.current.has(mediaId)) return;
     const seekPosition = Math.max(0, Number(value) || 0);
     setLibrary((items) => items.map((item) => item.id === mediaId ? { ...item, seekPosition } : item));
     setMedia((current) => current?.id === mediaId ? { ...current, seekPosition } : current);
@@ -627,10 +771,28 @@ function App() {
     setDeleteDialog({ type: 'group', group, count });
   }
 
+  function stopMetadataSavesForDeletion(ids) {
+    const deleting = new Set(ids);
+    for (const id of deleting) {
+      deletedMediaIdsRef.current.add(id);
+      const timer = positionSaveTimersRef.current.get(id);
+      if (timer) clearTimeout(timer);
+      positionSaveTimersRef.current.delete(id);
+    }
+    if (activeMediaRef.current && deleting.has(activeMediaRef.current.id)) {
+      clearTimeout(volumeSaveTimerRef.current);
+      volumeSaveTimerRef.current = null;
+      activeMediaRef.current = null;
+      setMedia(null);
+      setCaptions([]);
+    }
+  }
+
   async function confirmDelete() {
     try {
       if (deleteDialog.type === 'group') {
         const groupMediaIds = library.filter((item) => item.groupId === deleteDialog.group.id).map((item) => item.id);
+        stopMetadataSavesForDeletion(groupMediaIds);
         await stopTranscriptionsFor(groupMediaIds);
         const result = await ipcRenderer.invoke('delete-group', deleteDialog.group.id);
         const deleted = new Set(result.mediaIds);
@@ -641,6 +803,7 @@ function App() {
         setStatus(`Deleted group ${deleteDialog.group.name} and ${deleted.size} media item${deleted.size === 1 ? '' : 's'}.`);
         return;
       }
+      stopMetadataSavesForDeletion(deleteDialog.ids);
       await stopTranscriptionsFor(deleteDialog.ids);
       const deletedIds = await ipcRenderer.invoke('delete-media', deleteDialog.ids);
       const deleted = new Set(deletedIds);
@@ -665,11 +828,15 @@ function App() {
         <nav className="app-menu__items" aria-label="Main menu" onClick={(event) => event.stopPropagation()}>
           <div className="app-menu__dropdown">
             <button type="button" onClick={() => setAppMenu((value) => value === 'file' ? null : 'file')}>File</button>
-            {appMenu === 'file' && <div className="app-menu__popup"><button type="button" disabled={isImporting} onClick={() => { chooseMedia(); setAppMenu(null); }}>Import media <kbd>Ctrl+O</kbd></button><button type="button" onClick={() => { openUpload(); setAppMenu(null); }}>Import from phone</button></div>}
+            {appMenu === 'file' && <div className="app-menu__popup"><button type="button" disabled={isImporting} onClick={() => { chooseMedia(); setAppMenu(null); }}>Import media <kbd>Ctrl+O</kbd></button><button type="button" onClick={openUrlDownloadDialog}>Download from URL</button><button type="button" onClick={() => { openUpload(); setAppMenu(null); }}>Import from phone</button></div>}
           </div>
           <div className="app-menu__dropdown">
             <button type="button" onClick={() => setAppMenu((value) => value === 'view' ? null : 'view')}>View</button>
             {appMenu === 'view' && <div className="app-menu__popup"><button type="button" onClick={() => { setDarkTheme((value) => !value); setAppMenu(null); }}><span>{darkTheme ? <Sun /> : <Moon />} Toggle colour theme</span><kbd>Ctrl+Shift+T</kbd></button></div>}
+          </div>
+          <div className="app-menu__dropdown">
+            <button type="button" onClick={() => setAppMenu((value) => value === 'settings' ? null : 'settings')}>Settings</button>
+            {appMenu === 'settings' && <div className="app-menu__popup"><button type="button" role="menuitemcheckbox" aria-checked={playMediaInBackground} onClick={() => setPlayMediaInBackground((value) => !value)}><span><input type="checkbox" checked={playMediaInBackground} readOnly tabIndex={-1} /> Play media in background</span></button></div>}
           </div>
           <div className="app-menu__dropdown">
             <button type="button" onClick={() => setAppMenu((value) => value === 'window' ? null : 'window')}>Window</button>
@@ -705,7 +872,7 @@ function App() {
       <div className="side-nav__resize-handle" role="separator" aria-label="Resize media library" aria-orientation="vertical" onPointerDown={beginSideNavResize} />
 
       <section className="workspace">
-        {media && <MediaPlayer key={media.id} mediaId={media.id} src={media.playbackPath || `library/${media.media}`} captions={captions} hasCaptions={Boolean(media.caption)} volume={media.volume ?? 1} volumeRevealRequest={volumeRevealRequest} playbackToggleRequest={playbackToggleRequest} playbackSeekRequest={playbackSeekRequest} initialPosition={media.seekPosition ?? 0} autoplay={autoplayNext} onPlayingChange={setMediaWasPlaying} onCurrentPosition={(mediaId, value) => { if (activeMediaRef.current?.id === mediaId) currentPositionRef.current = value; }} onPositionChange={saveMediaPosition} dark={darkTheme} showMedia={media.type !== 'audio'} fullscreenRequest={playerFullscreenRequest} videoFullscreenRequest={videoFullscreenRequest} transcribing={transcribingMediaId === media.id} queued={queuedTranscriptionIds.has(media.id)} transcriptionProgress={progress} onTranscribe={transcribeMedia} onVolumeChange={saveMediaVolume} onToggleTheme={() => setDarkTheme((value) => !value)} />}
+        {media && <MediaPlayer key={media.id} mediaId={media.id} src={media.playbackPath || `library/${media.media}`} captions={captions} hasCaptions={Boolean(media.caption)} volume={media.volume ?? 1} loop={Boolean(media.loop)} volumeRevealRequest={volumeRevealRequest} playbackToggleRequest={playbackToggleRequest} playbackSeekRequest={playbackSeekRequest} initialPosition={media.seekPosition ?? 0} autoplay={autoplayNext} onPlayingChange={setMediaWasPlaying} onCurrentPosition={(mediaId, value) => { if (activeMediaRef.current?.id === mediaId) currentPositionRef.current = value; }} onPositionChange={saveMediaPosition} dark={darkTheme} showMedia={media.type !== 'audio'} playInBackground={playMediaInBackground} fullscreenRequest={playerFullscreenRequest} videoFullscreenRequest={videoFullscreenRequest} transcribing={transcribingMediaId === media.id} queued={queuedTranscriptionIds.has(media.id)} transcriptionProgress={progress} onTranscribe={transcribeMedia} onVolumeChange={saveMediaVolume} onLoopChange={saveMediaLoop} onToggleTheme={() => setDarkTheme((value) => !value)} />}
       </section>
       </div>
       {contextMenu && <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>
@@ -736,6 +903,17 @@ function App() {
           <h3>{deleteDialog.type === 'group' ? 'Delete group and its media?' : 'Delete media?'}</h3><p>{deleteDialog.type === 'group' ? <>Delete <strong>{deleteDialog.group.name}</strong> and all {deleteDialog.count} media item{deleteDialog.count === 1 ? '' : 's'} in it, including their caption JSON files?</> : <>Delete <strong>{deleteDialog.name}</strong> from the library, including its caption JSON file if present?</>}</p>
           <div><button type="button" onClick={() => setDeleteDialog(null)}>Cancel</button><button className="name-dialog__delete" type="button" onClick={confirmDelete}>Delete</button></div>
         </div>
+      </div>}
+      {urlDialog && <div className="name-dialog-backdrop" onMouseDown={() => setUrlDialog(null)}>
+        <form className="name-dialog url-download-dialog" onSubmit={downloadFromUrl} onMouseDown={(event) => event.stopPropagation()}>
+          <h3>Download from URL</h3>
+          <p>Paste a webpage or direct media URL. Capdio will inspect the page, download its video, and combine streams when needed.</p>
+          <input ref={urlInputRef} autoFocus type="url" required placeholder="https://example.com/video" value={urlDialog.url} disabled={urlDialog.downloading || Boolean(urlDialog.available)} onChange={(event) => setUrlDialog((dialog) => ({ ...dialog, url: event.target.value, error: '', available: null, selectedUrls: [] }))} />
+          {urlDialog.available && <div className="url-download-dialog__available"><div className="url-download-dialog__selection"><strong>{urlDialog.available.length} available</strong><span><button type="button" disabled={urlDialog.downloading} onClick={() => setUrlDialog((dialog) => ({ ...dialog, selectedUrls: dialog.available.map((item) => item.url) }))}>Select all</button><button type="button" disabled={urlDialog.downloading} onClick={() => setUrlDialog((dialog) => ({ ...dialog, selectedUrls: dialog.selectedUrls.filter((url) => dialog.available.some((item) => item.url === url && item.state === 'downloaded')) }))}>Clear</button></span></div>{urlDialog.available.length ? urlDialog.available.map((item, index) => <label key={item.id}><input type="checkbox" checked={urlDialog.selectedUrls.includes(item.url)} disabled={urlDialog.downloading || item.state === 'downloaded'} onChange={() => setUrlDialog((dialog) => ({ ...dialog, selectedUrls: dialog.selectedUrls.includes(item.url) ? dialog.selectedUrls.filter((url) => url !== item.url) : [...dialog.selectedUrls, item.url] }))} /><span><strong>{index + 1}. {item.name}</strong><small>{item.type} · {item.host}</small></span><em className={`url-download-dialog__item-state is-${item.state || 'idle'}`}>{item.state === 'downloaded' ? <><Check /> Downloaded</> : item.state === 'downloading' ? 'Downloading…' : item.state === 'importing' ? 'Importing…' : item.state === 'queued' ? 'Queued' : item.state === 'failed' ? 'Failed' : ''}</em></label>) : <p>No downloadable media was detected.</p>}</div>}
+          {urlDialog.downloading && <div className="url-download-dialog__progress" role="status"><span /><p>{urlDialog.progressMessage || 'Working…'}</p></div>}
+          {urlDialog.error && <p className="url-download-dialog__error">{urlDialog.error}</p>}
+          <div><button type="button" onClick={() => setUrlDialog(null)}>Close</button>{urlDialog.downloading && <button className="url-download-dialog__cancel" type="button" onClick={cancelUrlDownload}>Cancel</button>}{urlDialog.available && <button type="button" disabled={urlDialog.downloading} onClick={changeDownloadUrl}>Change URL</button>}<button type="submit" disabled={urlDialog.downloading || (urlDialog.available && !urlDialog.selectedUrls.some((url) => urlDialog.available.some((item) => item.url === url && item.state !== 'downloaded')))}>{urlDialog.downloading ? 'Working…' : urlDialog.available ? `Download selected (${urlDialog.selectedUrls.filter((url) => urlDialog.available.some((item) => item.url === url && item.state !== 'downloaded')).length})` : 'Find media'}</button></div>
+        </form>
       </div>}
       {uploadSession && <div className="name-dialog-backdrop" onMouseDown={() => setUploadSession(null)}><div className="upload-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}><button className="upload-dialog__close" type="button" onClick={() => setUploadSession(null)} aria-label="Close"><X /></button><h3>Import from phone</h3><p>Scan this code with a phone on the same Wi-Fi network, then select one or more audio/video files.</p><img src={uploadSession.qrCode} alt={`QR code for ${uploadSession.url}`} /><code>{uploadSession.url}</code><div className="upload-dialog__queue">{uploads.length ? uploads.map((upload) => <div key={upload.id}><span>{upload.name}</span><span>{upload.state === 'uploading' ? <><progress value={upload.progress || 0} max="100" />{upload.progress || 0}%</> : upload.state === 'importing' ? 'Importing…' : upload.state === 'complete' ? 'Imported' : upload.state === 'error' ? 'Failed' : upload.state === 'cancelled' ? 'Cancelled' : upload.state === 'received' ? 'Received' : 'Queued'}</span></div>) : <p>Waiting for uploads…</p>}</div><button className="upload-dialog__cancel" type="button" onClick={cancelUploads}>Cancel pending uploads</button></div></div>}
     </main>
@@ -777,7 +955,7 @@ function InlineName({ className, rename, onChange, onCommit }) {
 }
 
 function MediaItem({ item, selected, active, inlineRename, transcribing, queued, progress, onRenameChange, onRenameCommit, onSelect, onContextMenu, onDragStart, onDragEnd }) {
-  return <div draggable={!inlineRename} key={item.id} role="button" className={`side-nav__item ${active ? 'is-selected' : ''} ${selected ? 'is-multi-selected' : ''}`} onClick={(event) => { if (inlineRename?.type === 'media' && inlineRename.id === item.id) return; onSelect(item, event); }} onContextMenu={(event) => onContextMenu(event, 'media', item)} onDragStart={(event) => { if (inlineRename) { event.preventDefault(); return; } if (onDragStart) onDragStart(event, item); else event.dataTransfer.setData('text/media-id', item.id); }} onDragEnd={onDragEnd}>
+  return <div draggable={!inlineRename} key={item.id} role="button" aria-current={active ? 'true' : undefined} aria-pressed={selected} className={`side-nav__item ${active ? 'is-selected' : ''} ${selected ? 'is-multi-selected' : ''}`} onClick={(event) => { if (inlineRename?.type === 'media' && inlineRename.id === item.id) return; onSelect(item, event); }} onContextMenu={(event) => onContextMenu(event, 'media', item)} onDragStart={(event) => { if (inlineRename) { event.preventDefault(); return; } if (onDragStart) onDragStart(event, item); else event.dataTransfer.setData('text/media-id', item.id); }} onDragEnd={onDragEnd}>
     <span className={`side-nav__media-icon side-nav__media-icon--${item.type || 'video'}`} aria-hidden="true">{item.type === 'audio' ? <Music /> : <Video />}</span>
     {inlineRename?.type === 'media' && inlineRename.id === item.id ? <InlineName className="side-nav__name" rename={inlineRename} onChange={onRenameChange} onCommit={onRenameCommit} /> : <span className="side-nav__name">{item.name}</span>}
     {transcribing && <span className="side-nav__transcription-progress" style={{ '--progress': `${progress}%` }}>{progress}%</span>}

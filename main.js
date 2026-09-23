@@ -3,7 +3,8 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const fsSync = require('node:fs');
 const fs = require('node:fs/promises');
-const { Readable } = require('node:stream');
+const { Readable, Transform } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const crypto = require('node:crypto');
 const http = require('node:http');
 const os = require('node:os');
@@ -46,7 +47,11 @@ const developmentPythonExecutable = process.env.CAPDIO_PYTHON
     || (fsSync.existsSync(bundledDevelopmentPython) ? bundledDevelopmentPython : 'python');
 const ffmpegExecutable = app.isPackaged
     ? path.join(platformBinaryDirectory, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
-    : 'ffmpeg';
+    : (process.env.CAPDIO_FFMPEG || require('ffmpeg-static') || 'ffmpeg');
+const stagedDevelopmentYtDlp = path.join(__dirname, 'resources', 'bin', `${process.platform}-${process.arch}`, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+const ytDlpExecutable = app.isPackaged
+    ? path.join(platformBinaryDirectory, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
+    : (process.env.CAPDIO_YT_DLP || (fsSync.existsSync(stagedDevelopmentYtDlp) ? stagedDevelopmentYtDlp : 'yt-dlp'));
 const transcriberExecutable = app.isPackaged
     ? path.join(platformBinaryDirectory, 'capdio-transcribe', process.platform === 'win32' ? 'capdio-transcribe.exe' : 'capdio-transcribe')
     : developmentPythonExecutable;
@@ -85,6 +90,24 @@ function mediaMimeType(filePath) {
 }
 
 const supportedMediaExtensions = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.mp4', '.mkv', '.avi', '.mov', '.webm']);
+const deletingMediaIds = new Set();
+const pendingMetadataWrites = new Map();
+
+function trackMetadataWrite(mediaId, promise) {
+    if (!pendingMetadataWrites.has(mediaId)) pendingMetadataWrites.set(mediaId, new Set());
+    pendingMetadataWrites.get(mediaId).add(promise);
+    promise.finally(() => {
+        const pending = pendingMetadataWrites.get(mediaId);
+        pending?.delete(promise);
+        if (!pending?.size) pendingMetadataWrites.delete(mediaId);
+    }).catch(() => {});
+    return promise;
+}
+
+async function prepareMetadataDeletion(mediaIds) {
+    for (const id of mediaIds) deletingMediaIds.add(id);
+    await Promise.all(mediaIds.flatMap((id) => [...(pendingMetadataWrites.get(id) || [])].map((promise) => promise.catch(() => {}))));
+}
 let uploadSessionServer = null;
 let uploadSessionQueue = [];
 let uploadSessionRunning = false;
@@ -310,6 +333,7 @@ ipcMain.handle('delete-media', async (event, mediaIds) => {
     const manifest = await readManifest();
     const ids = new Set(Array.isArray(mediaIds) ? mediaIds : []);
     const removing = manifest.media.filter((item) => ids.has(item.id));
+    await prepareMetadataDeletion(removing.map((item) => item.id));
     await Promise.all(removing.flatMap((item) => {
         const files = [fs.unlink(mediaPathFor(item)).catch(() => {}), fs.unlink(metadataPath(item.id)).catch(() => {})];
         files.push(fs.unlink(captionPathFor(item)).catch(() => {}));
@@ -325,6 +349,7 @@ ipcMain.handle('delete-group', async (event, groupId) => {
     const group = manifest.groups.find((item) => item.id === groupId);
     if (!group) throw new Error('Group was not found.');
     const removing = manifest.media.filter((item) => item.groupId === groupId);
+    await prepareMetadataDeletion(removing.map((item) => item.id));
     await Promise.all(removing.flatMap((item) => {
         const files = [fs.unlink(mediaPathFor(item)).catch(() => {}), fs.unlink(metadataPath(item.id)).catch(() => {}), fs.unlink(captionPathFor(item)).catch(() => {})];
         return files;
@@ -451,17 +476,558 @@ async function importMediaFile(sourceFile, groupId = null, originalName = path.b
     };
     manifest.media.push(item);
     await writeManifest(manifest);
-    await writeMetadata(id, { name: path.parse(sourceName).name, groupId, volume: 1 });
+    await writeMetadata(id, { name: path.parse(sourceName).name, groupId, volume: 1, loop: false });
     return {
         ...item,
         absolutePath: destination,
         playbackPath: `capdio://library/media/${id}${extension}`,
-        media: `media/${id}${extension}`, caption: null, name: path.parse(sourceName).name, groupId, volume: 1
+        media: `media/${id}${extension}`, caption: null, name: path.parse(sourceName).name, groupId, volume: 1, loop: false
     };
 }
 
 ipcMain.handle('import-media', (event, sourceFile, groupId = null) => {
     return importMediaFile(sourceFile, groupId);
+});
+
+let activeUrlDownload = null;
+let lastUrlDiscovery = null;
+
+function sendUrlDownloadStatus(sender, message) {
+    if (activeUrlDownload) activeUrlDownload.progressMessage = message;
+    if (sender && !sender.isDestroyed()) sender.send('url-download-status', message);
+}
+
+function runProcess(executable, arguments_, onLine, timeoutMs = 15 * 60 * 1000, signal = null) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(executable, arguments_, { windowsHide: true });
+        let stderr = '';
+        let settled = false;
+        let terminationError = null;
+        let stopPromise = null;
+        let forceFinishTimer = null;
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            clearTimeout(forceFinishTimer);
+            signal?.removeEventListener('abort', abort);
+            callback(value);
+        };
+        const requestStop = (error) => {
+            if (settled || terminationError) return;
+            terminationError = error;
+            if (process.platform === 'win32' && child.pid) {
+                // yt-dlp can launch FFmpeg. Killing only the parent leaves the
+                // child holding its output file open, so terminate the complete
+                // Windows process tree and wait for taskkill to finish.
+                stopPromise = new Promise((resolveStop) => {
+                    const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true });
+                    killer.once('error', () => { child.kill(); resolveStop(); });
+                    killer.once('close', resolveStop);
+                });
+            } else {
+                child.kill();
+                stopPromise = Promise.resolve();
+            }
+            // Normally 'close' fires after all stdio handles are released. Do
+            // not block forever if a broken child ignores termination.
+            forceFinishTimer = setTimeout(() => finish(reject, error), 10000);
+        };
+        const timeout = setTimeout(() => {
+            requestStop(new Error(`${path.basename(executable)} stopped responding and was cancelled.`));
+        }, timeoutMs);
+        const abort = () => requestStop(new Error('Download cancelled.'));
+        if (signal?.aborted) return abort();
+        signal?.addEventListener('abort', abort, { once: true });
+        child.stdout.on('data', (data) => onLine?.(data.toString()));
+        child.stderr.on('data', (data) => {
+            stderr = `${stderr}${data}`.slice(-12000);
+            onLine?.(data.toString());
+        });
+        child.once('error', (error) => finish(reject, error));
+        child.once('close', (code) => {
+            if (terminationError) {
+                Promise.resolve(stopPromise).then(() => finish(reject, terminationError));
+            } else if (code === 0) {
+                finish(resolve);
+            } else {
+                finish(reject, new Error(stderr.trim() || `${path.basename(executable)} exited with code ${code}.`));
+            }
+        });
+    });
+}
+
+async function removeStagedFile(filePath, reportFailure = true) {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+        try {
+            await fs.unlink(filePath);
+            return;
+        } catch (error) {
+            if (error.code === 'ENOENT') return;
+            if (attempt === 11) {
+                if (reportFailure) console.error(`Unable to remove staged download ${filePath}:`, error.message);
+                return;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+    }
+}
+
+async function downloadDirectMedia(url, destination, headers, signal, onProgress) {
+    const response = await fetch(url, {
+        redirect: 'follow',
+        signal,
+        headers: Object.fromEntries(headers.map((header) => {
+            const separator = header.indexOf(':');
+            return [header.slice(0, separator), header.slice(separator + 1).trim()];
+        }))
+    });
+    if (!response.ok) throw new Error(`The media server returned HTTP ${response.status}.`);
+    const contentType = response.headers.get('content-type') || '';
+    if (/^(?:text\/html|application\/(?:json|xml))/i.test(contentType)) {
+        throw new Error(`The URL returned ${contentType} instead of a media file.`);
+    }
+    if (!response.body) throw new Error('The media server returned an empty response.');
+    const total = Number(response.headers.get('content-length')) || 0;
+    let received = 0;
+    let lastUpdate = 0;
+    const progress = new Transform({
+        transform(chunk, _encoding, callback) {
+            received += chunk.length;
+            const now = Date.now();
+            if (now - lastUpdate > 200) {
+                lastUpdate = now;
+                onProgress(total ? Math.min(99, Math.round(received / total * 100)) : null, received);
+            }
+            callback(null, chunk);
+        }
+    });
+    await pipeline(Readable.fromWeb(response.body), progress, fsSync.createWriteStream(destination), { signal });
+    if (!received) throw new Error('The media server returned an empty file.');
+    if (path.extname(destination).toLowerCase() === '.mp4') {
+        const handle = await fs.open(destination, 'r');
+        try {
+            const header = Buffer.alloc(64);
+            const { bytesRead } = await handle.read(header, 0, header.length, 0);
+            if (!header.subarray(0, bytesRead).includes(Buffer.from('ftyp'))) {
+                throw new Error('The URL did not return a valid MP4 file.');
+            }
+        } finally {
+            await handle.close();
+        }
+    }
+    onProgress(100, received);
+}
+
+function sendUrlDownloadItemStatus(sender, url, state, details = {}) {
+    if (sender && !sender.isDestroyed()) sender.send('url-download-item-status', { url, state, ...details });
+}
+
+async function clearUrlDownloadStaging() {
+    const stagingDirectory = path.join(libraryRoot, '.downloads');
+    await fs.mkdir(stagingDirectory, { recursive: true });
+    const entries = await fs.readdir(stagingDirectory);
+    await Promise.all(entries.map((name) => fs.rm(path.join(stagingDirectory, name), {
+        recursive: true,
+        force: true,
+        maxRetries: 12,
+        retryDelay: 200
+    })));
+}
+
+function safeDownloadName(value) {
+    return String(value || 'Downloaded video').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '').slice(0, 100) || 'Downloaded video';
+}
+
+function parseHttpUrl(rawUrl) {
+    const value = String(rawUrl || '').trim();
+    const markdownLink = /^\[[^\]]*\]\((https?:\/\/[^)]+)\)$/i.exec(value);
+    let parsed;
+    try { parsed = new URL(markdownLink ? markdownLink[1] : value); } catch { throw new Error('Enter a valid webpage or media URL.'); }
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only HTTP and HTTPS URLs are supported.');
+    return parsed;
+}
+
+function abortableDelay(milliseconds, signal) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(done, milliseconds);
+        function done() {
+            signal?.removeEventListener('abort', abort);
+            resolve();
+        }
+        function abort() {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', abort);
+            reject(new Error('Download cancelled.'));
+        }
+        if (signal?.aborted) abort();
+        else signal?.addEventListener('abort', abort, { once: true });
+    });
+}
+
+async function findRenderedMedia(pageUrl, sender, signal = null) {
+    const candidates = new Map();
+    const rejectedCandidates = new Set();
+    const add = (url, type = '') => {
+        try {
+            const absolute = new URL(url, pageUrl).href;
+            if (!/^https?:/i.test(absolute)) return;
+            if (rejectedCandidates.has(absolute)) return;
+            // These are individual adaptive-stream chunks, not independently
+            // playable media. Their parent .mpd/.m3u8 manifest is captured and
+            // passed to FFmpeg instead.
+            if (/\.(?:m4s|cmfv|cmfa|ts)(?:$|[?#])/i.test(absolute)) return;
+            const score = (/\.m3u8(?:$|\?)/i.test(absolute) ? 90 : /\.mpd(?:$|\?)/i.test(absolute) ? 85 : /\.(?:mp4|webm|mov|mkv|m4v)(?:$|\?)/i.test(absolute) ? 70 : /^video\//i.test(type) ? 60 : /^audio\//i.test(type) ? 25 : 0);
+            if (score) candidates.set(absolute, Math.max(score, candidates.get(absolute) || 0));
+        } catch { /* Ignore malformed URLs exposed by page scripts. */ }
+    };
+    const inspector = new BrowserWindow({ show: false, width: 1024, height: 720, webPreferences: { sandbox: true, contextIsolation: true } });
+    const abortInspection = () => { if (!inspector.isDestroyed()) inspector.destroy(); };
+    signal?.addEventListener('abort', abortInspection, { once: true });
+    const filter = { urls: ['http://*/*', 'https://*/*'] };
+    const beforeRequest = (details, callback) => {
+        add(details.url, details.resourceType === 'media' ? 'video/unknown' : '');
+        callback({});
+    };
+    const headersReceived = (details, callback) => {
+        const contentType = details.responseHeaders?.['content-type']?.[0] || details.responseHeaders?.['Content-Type']?.[0] || '';
+        if (/^(?:text\/html|application\/(?:json|xml))/i.test(contentType)) {
+            try {
+                const absolute = new URL(details.url, pageUrl).href;
+                rejectedCandidates.add(absolute);
+                candidates.delete(absolute);
+            } catch { /* Ignore malformed response URLs. */ }
+        } else {
+            add(details.url, contentType);
+        }
+        callback({ responseHeaders: details.responseHeaders });
+    };
+    inspector.webContents.session.webRequest.onBeforeRequest(filter, beforeRequest);
+    inspector.webContents.session.webRequest.onHeadersReceived(filter, headersReceived);
+    try {
+        sendUrlDownloadStatus(sender, 'Opening webpage and detecting media…');
+        await Promise.race([
+            inspector.loadURL(pageUrl, { userAgent: inspector.webContents.getUserAgent() }),
+            abortableDelay(30000, signal).then(() => { throw new Error('The webpage took too long to load.'); })
+        ]);
+        await abortableDelay(4500, signal);
+        let page = { title: pageUrl.hostname, urls: [] };
+        try {
+            page = await inspector.webContents.executeJavaScript(`(() => {
+                const domUrls = [];
+                for (const element of document.querySelectorAll('video, audio')) {
+                    try {
+                        const source = element.currentSrc || element.src || element.querySelector('source')?.src;
+                        if (source) domUrls.push(source);
+                    } catch { /* Keep inspecting the remaining media elements. */ }
+                }
+                const found = new Set(domUrls);
+                try {
+                    performance.getEntriesByType('resource').forEach((entry) => found.add(entry.name));
+                } catch { /* Resource timing may be restricted by the page. */ }
+                try {
+                    const urlPattern = /https?:\\/\\/[^\\s"'<>\\\\]+/g;
+                    document.querySelectorAll('script:not([src])').forEach((script) => {
+                        for (const url of ((script.textContent || '').match(urlPattern) || [])) {
+                            found.add(url.replace(/\\\\u0026/g, '&').replace(/\\\\\//g, '/'));
+                        }
+                    });
+                } catch { /* Inline script scanning is optional. */ }
+                return { title: document.title, urls: [...found], domUrls: [...new Set(domUrls)] };
+            })()`, true);
+        } catch (error) {
+            // Some pages continuously navigate, tear down their renderer, or
+            // prohibit page-world evaluation. Network observation above still
+            // discovers media requested by those pages, so do not discard it.
+            console.warn('Page DOM media inspection was unavailable:', error.message);
+            sendUrlDownloadStatus(sender, 'Page script inspection was blocked; checking captured media requests…');
+        }
+        for (const url of page.urls || []) add(url);
+        const cookies = await inspector.webContents.session.cookies.get({ url: pageUrl });
+        const domMediaUrls = [...new Set((page.domUrls || []).filter((url) => {
+            try {
+                const absolute = new URL(url, pageUrl).href;
+                return /^https?:/i.test(absolute) && !/\.(?:m4s|cmfv|cmfa|ts)(?:$|[?#])/i.test(absolute);
+            } catch { return false; }
+        }).map((url) => new URL(url, pageUrl).href))];
+        return {
+            title: safeDownloadName(page.title),
+            // A page may request dozens of rendition playlists for ten actual
+            // video elements. Prefer one active source per element so quality
+            // variants and separate tracks are not presented as extra videos.
+            mediaUrls: domMediaUrls.length ? domMediaUrls : [...candidates].sort((a, b) => b[1] - a[1]).map(([url]) => url),
+            cookieHeader: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '),
+            userAgent: inspector.webContents.getUserAgent()
+        };
+    } finally {
+        inspector.webContents.session.webRequest.onBeforeRequest(filter, null);
+        inspector.webContents.session.webRequest.onHeadersReceived(filter, null);
+        signal?.removeEventListener('abort', abortInspection);
+        if (!inspector.isDestroyed()) inspector.destroy();
+    }
+}
+
+ipcMain.handle('discover-url-media', async (event, rawUrl) => {
+    let pageUrl;
+    try { pageUrl = parseHttpUrl(rawUrl); } catch (error) {
+        return { cancelled: false, available: [], error: error.message };
+    }
+    if (activeUrlDownload?.running) {
+        return { cancelled: false, available: [], error: 'Another URL task is already running.' };
+    }
+    const directExtension = path.extname(pageUrl.pathname).toLowerCase();
+    if (supportedMediaExtensions.has(directExtension)) {
+        const name = decodeURIComponent(path.posix.basename(pageUrl.pathname)) || `media${directExtension}`;
+        const found = {
+            title: safeDownloadName(path.parse(name).name),
+            mediaUrls: [pageUrl.href],
+            cookieHeader: '',
+            userAgent: BrowserWindow.fromWebContents(event.sender)?.webContents.getUserAgent() || 'Mozilla/5.0'
+        };
+        lastUrlDiscovery = { pageUrl: pageUrl.href, found };
+        return {
+            cancelled: false,
+            available: [{
+                id: crypto.createHash('sha1').update(pageUrl.href).digest('hex'),
+                url: pageUrl.href,
+                name,
+                type: directExtension.slice(1).toUpperCase(),
+                host: pageUrl.host
+            }]
+        };
+    }
+    const controller = new AbortController();
+    activeUrlDownload = { running: true, url: pageUrl.href, progressMessage: 'Opening webpage and detecting media...', controller };
+    try {
+        try {
+            sendUrlDownloadStatus(event.sender, 'Checking the URL with the media extractor…');
+            let extractorOutput = '';
+            await runProcess(ytDlpExecutable, [
+                '--no-playlist', '--skip-download', '--dump-single-json', '--quiet', '--no-warnings', pageUrl.href
+            ], (output) => { extractorOutput += output; }, 60000, controller.signal);
+            const info = JSON.parse(extractorOutput.trim());
+            const title = safeDownloadName(info.title || pageUrl.hostname);
+            const found = {
+                title,
+                mediaUrls: [pageUrl.href],
+                cookieHeader: '',
+                userAgent: info.http_headers?.['User-Agent'] || 'Mozilla/5.0',
+                extractorPage: true
+            };
+            lastUrlDiscovery = { pageUrl: pageUrl.href, found };
+            return {
+                cancelled: false,
+                available: [{
+                    id: crypto.createHash('sha1').update(pageUrl.href).digest('hex'),
+                    url: pageUrl.href,
+                    name: title,
+                    type: String(info.extractor_key || info.extractor || 'WEB VIDEO').toUpperCase(),
+                    host: pageUrl.host
+                }]
+            };
+        } catch (extractorError) {
+            if (controller.signal.aborted) return { cancelled: true, available: [] };
+            // Unsupported sites and development installs without yt-dlp fall
+            // through to rendered-page inspection.
+        }
+        const found = await findRenderedMedia(pageUrl.href, event.sender, controller.signal);
+        lastUrlDiscovery = { pageUrl: pageUrl.href, found };
+        const available = found.mediaUrls.map((url, index) => {
+            const parsed = new URL(url);
+            const fileName = decodeURIComponent(path.posix.basename(parsed.pathname)) || `Media ${index + 1}`;
+            const type = /\.m3u8(?:$|\?)/i.test(url) ? 'HLS' : /\.mpd(?:$|\?)/i.test(url) ? 'DASH' : (path.extname(parsed.pathname).slice(1).toUpperCase() || 'MEDIA');
+            return { id: crypto.createHash('sha1').update(url).digest('hex'), url, name: fileName, type, host: parsed.host };
+        });
+        return { cancelled: false, available };
+    } catch (error) {
+        if (controller.signal.aborted) return { cancelled: true, available: [] };
+        const message = /^ERR_[A-Z_]+/.test(error.message)
+            ? 'The webpage could not be loaded. Check the URL and make sure the server is reachable.'
+            : error.message;
+        return { cancelled: false, available: [], error: message };
+    } finally {
+        activeUrlDownload.running = false;
+    }
+});
+
+ipcMain.handle('get-url-download-state', () => activeUrlDownload ? {
+    running: activeUrlDownload.running,
+    url: activeUrlDownload.url,
+    progressMessage: activeUrlDownload.progressMessage
+} : null);
+
+ipcMain.handle('cancel-url-download', () => {
+    if (!activeUrlDownload?.running) return false;
+    activeUrlDownload.progressMessage = 'Cancelling download...';
+    activeUrlDownload.controller.abort();
+    return true;
+});
+
+ipcMain.handle('download-from-url', async (event, rawUrl, selectedUrls = []) => {
+    const pageUrl = parseHttpUrl(rawUrl);
+
+    const sender = event.sender;
+    if (activeUrlDownload?.running) throw new Error('Another URL download is already running.');
+    const controller = new AbortController();
+    activeUrlDownload = { running: true, url: pageUrl.href, progressMessage: 'Preparing download...', controller };
+    const stagingDirectory = path.join(libraryRoot, '.downloads');
+    await fs.mkdir(stagingDirectory, { recursive: true });
+    const token = crypto.randomUUID();
+    const outputTemplate = path.join(stagingDirectory, `${token}.%(autonumber)03d.%(ext)s`);
+    const resultListPath = path.join(stagingDirectory, `${token}.result.txt`);
+    const downloadedFiles = [];
+    const items = [];
+    const failures = [];
+    const completedUrls = new Set();
+    const useExtractorSelection = selectedUrls.length === 1
+        && selectedUrls[0] === pageUrl.href
+        && lastUrlDiscovery?.pageUrl === pageUrl.href
+        && lastUrlDiscovery.found.extractorPage;
+    let downloadedTitle = pageUrl.hostname;
+    if (useExtractorSelection) downloadedTitle = lastUrlDiscovery.found.title;
+
+    try {
+        for (const url of selectedUrls) sendUrlDownloadItemStatus(sender, url, 'queued');
+        sendUrlDownloadStatus(sender, selectedUrls.length ? 'Preparing selected media…' : 'Checking the page for media…');
+        try {
+            if (selectedUrls.length && !useExtractorSelection) {
+                const selection = new Error('Use selected browser media.');
+                selection.isMediaSelection = true;
+                throw selection;
+            }
+            if (useExtractorSelection) sendUrlDownloadItemStatus(sender, pageUrl.href, 'downloading', { position: 1, total: 1 });
+            const extractorArguments = [
+                useExtractorSelection ? '--no-playlist' : '--yes-playlist', '--no-part', '--newline', '--restrict-filenames', '--windows-filenames',
+                '--ffmpeg-location', ffmpegExecutable, '--merge-output-format', 'mp4',
+                '--print-to-file', 'after_move:%(filepath)s', resultListPath,
+                '-f', 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4][vcodec^=avc1]/bv*+ba/b', '-o', useExtractorSelection ? path.join(stagingDirectory, `${token}.%(ext)s`) : outputTemplate, pageUrl.href
+            ];
+            await runProcess(ytDlpExecutable, extractorArguments, (output) => {
+                const percentage = /\[download\]\s+([\d.]+)%/.exec(output)?.[1];
+                if (percentage) sendUrlDownloadStatus(sender, `Downloading page media… ${Math.round(Number(percentage))}%`);
+            }, 15 * 60 * 1000, controller.signal);
+            const reportedFiles = (await fs.readFile(resultListPath, 'utf8').catch(() => ''))
+                .split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+            for (const reportedFile of reportedFiles) {
+                const resolved = path.resolve(reportedFile);
+                const relative = path.relative(stagingDirectory, resolved);
+                if (!relative.startsWith('..') && !path.isAbsolute(relative) && await fs.stat(resolved).then((stat) => stat.isFile()).catch(() => false)) {
+                    downloadedFiles.push(resolved);
+                }
+            }
+            if (!downloadedFiles.length) {
+                const producedFiles = (await fs.readdir(stagingDirectory))
+                    .filter((name) => name.startsWith(`${token}.`) && !name.endsWith('.part') && name !== path.basename(resultListPath) && !/\.f\d+\./i.test(name));
+                downloadedFiles.push(...producedFiles.map((name) => path.join(stagingDirectory, name)));
+            }
+        } catch (extractorError) {
+            if (controller.signal.aborted) throw new Error('Download cancelled.');
+            if (useExtractorSelection) {
+                failures.push({ url: pageUrl.href, error: 'The media extractor could not download this video.' });
+                sendUrlDownloadItemStatus(sender, pageUrl.href, 'failed', { error: failures[0].error });
+                return { cancelled: false, items, failures };
+            }
+            if (!extractorError.isMediaSelection && extractorError.code !== 'ENOENT' && !/not recognized|ENOENT/i.test(extractorError.message)) {
+                console.warn('yt-dlp fallback:', extractorError.message);
+            }
+            const cachedDiscovery = lastUrlDiscovery?.pageUrl === pageUrl.href ? lastUrlDiscovery.found : null;
+            const found = selectedUrls.length && cachedDiscovery
+                ? { ...cachedDiscovery, mediaUrls: [...cachedDiscovery.mediaUrls] }
+                : await findRenderedMedia(pageUrl.href, sender, controller.signal);
+            if (selectedUrls.length) {
+                found.mediaUrls = [...new Set(selectedUrls)].filter((url) => {
+                    try { return ['http:', 'https:'].includes(new URL(url).protocol); } catch { return false; }
+                });
+            }
+            if (!found.mediaUrls.length) {
+                throw new Error('No downloadable media request was detected. The site may require interaction, reject its TLS certificate, or use DRM-protected media.');
+            }
+            downloadedTitle = found.title || downloadedTitle;
+            const headers = [`Referer: ${pageUrl.href}`, `User-Agent: ${found.userAgent}`];
+            if (found.cookieHeader) headers.push(`Cookie: ${found.cookieHeader}`);
+
+            for (const [index, mediaUrl] of found.mediaUrls.entries()) {
+                const directExtension = path.extname(new URL(mediaUrl).pathname).toLowerCase();
+                const isDirectMedia = supportedMediaExtensions.has(directExtension);
+                const downloadedFile = path.join(stagingDirectory, `${token}.${String(index + 1).padStart(3, '0')}${isDirectMedia ? directExtension : '.mp4'}`);
+                sendUrlDownloadItemStatus(sender, mediaUrl, 'downloading', { position: index + 1, total: found.mediaUrls.length });
+                sendUrlDownloadStatus(sender, `Downloading media ${index + 1} of ${found.mediaUrls.length}${isDirectMedia ? '…' : ' with FFmpeg…'}`);
+                try {
+                    if (isDirectMedia) {
+                        await downloadDirectMedia(mediaUrl, downloadedFile, headers, controller.signal, (percentage, bytes) => {
+                            const progressText = percentage === null ? `${(bytes / 1048576).toFixed(1)} MB` : `${percentage}%`;
+                            sendUrlDownloadStatus(sender, `Media ${index + 1}/${found.mediaUrls.length}… ${progressText}`);
+                        });
+                    } else {
+                        await runProcess(ffmpegExecutable, [
+                            '-y', '-headers', `${headers.join('\r\n')}\r\n`, '-i', mediaUrl,
+                            '-c', 'copy', '-movflags', '+faststart',
+                            '-progress', 'pipe:1', '-stats_period', '1', downloadedFile
+                        ], (output) => {
+                            const time = /out_time=([^\r\n]+)/.exec(output)?.[1];
+                            const bytes = /total_size=(\d+)/.exec(output)?.[1];
+                            if (time || bytes) {
+                                const size = bytes ? ` · ${(Number(bytes) / 1048576).toFixed(1)} MB` : '';
+                                sendUrlDownloadStatus(sender, `Media ${index + 1}/${found.mediaUrls.length}… ${time || ''}${size}`);
+                            }
+                        }, 15 * 60 * 1000, controller.signal);
+                    }
+                    const displayName = found.mediaUrls.length === 1 ? downloadedTitle : `${downloadedTitle} ${index + 1}`;
+                    sendUrlDownloadItemStatus(sender, mediaUrl, 'importing');
+                    sendUrlDownloadStatus(sender, `Importing media ${index + 1} of ${found.mediaUrls.length}…`);
+                    const item = await importMediaFile(downloadedFile, null, `${safeDownloadName(displayName)}${path.extname(downloadedFile)}`);
+                    items.push(item);
+                    completedUrls.add(mediaUrl);
+                    sendUrlDownloadItemStatus(sender, mediaUrl, 'downloaded');
+                    if (!sender.isDestroyed()) sender.send('url-download-imported', item);
+                    await removeStagedFile(downloadedFile, false);
+                } catch (error) {
+                    await removeStagedFile(downloadedFile, false);
+                    if (controller.signal.aborted) throw new Error('Download cancelled.');
+                    failures.push({ url: mediaUrl, error: error.message });
+                    sendUrlDownloadItemStatus(sender, mediaUrl, 'failed', { error: error.message });
+                }
+            }
+        }
+
+        if (!downloadedFiles.length && !items.length && !failures.length) {
+            const error = 'The media extractor finished without producing a merged media file.';
+            failures.push({ url: pageUrl.href, error });
+            if (selectedUrls.length === 1) sendUrlDownloadItemStatus(sender, selectedUrls[0], 'failed', { error });
+        }
+        for (const [index, downloadedFile] of downloadedFiles.entries()) {
+            if (controller.signal.aborted) throw new Error('Download cancelled.');
+            const extension = path.extname(downloadedFile);
+            const displayName = downloadedFiles.length === 1 ? downloadedTitle : `${downloadedTitle} ${index + 1}`;
+            sendUrlDownloadStatus(sender, `Importing media ${index + 1} of ${downloadedFiles.length}…`);
+            if (selectedUrls.length === 1) sendUrlDownloadItemStatus(sender, selectedUrls[0], 'importing');
+            const item = await importMediaFile(downloadedFile, null, `${safeDownloadName(displayName)}${extension}`);
+            items.push(item);
+            if (selectedUrls.length === 1) {
+                completedUrls.add(selectedUrls[0]);
+                sendUrlDownloadItemStatus(sender, selectedUrls[0], 'downloaded');
+            }
+            if (!sender.isDestroyed()) sender.send('url-download-imported', item);
+            await removeStagedFile(downloadedFile, false);
+        }
+        sendUrlDownloadStatus(sender, `${items.length} media item${items.length === 1 ? '' : 's'} imported into the library.`);
+        return { cancelled: false, items, failures };
+    } catch (error) {
+        if (controller.signal.aborted || error.message === 'Download cancelled.') {
+            for (const url of selectedUrls) {
+                if (!completedUrls.has(url)) sendUrlDownloadItemStatus(sender, url, 'idle');
+            }
+            sendUrlDownloadStatus(sender, `Download cancelled. ${items.length} completed media item${items.length === 1 ? '' : 's'} kept.`);
+            return { cancelled: true, items };
+        }
+        throw error;
+    } finally {
+        activeUrlDownload.running = false;
+        const leftovers = await fs.readdir(stagingDirectory).catch(() => []);
+        await Promise.all(leftovers
+            .filter((name) => name.startsWith(token))
+            .map((name) => removeStagedFile(path.join(stagingDirectory, name))));
+    }
 });
 
 async function processUploadQueue() {
@@ -595,21 +1161,47 @@ ipcMain.handle('set-media-volume', async (event, mediaId, value) => {
     if (!Number.isFinite(volume) || volume < 0 || volume > 1) {
         throw new Error('Volume must be between 0 and 1.');
     }
-    const manifest = await readManifest();
-    const item = manifest.media.find((entry) => entry.id === mediaId);
-    if (!item) throw new Error('The imported media entry was not found in manifest.json.');
-    const metadata = await readMetadata(mediaId);
-    metadata.volume = volume;
-    await writeMetadata(mediaId, metadata);
-    return volume;
+    if (deletingMediaIds.has(mediaId)) throw new Error('The media item is being deleted.');
+    return trackMetadataWrite(mediaId, (async () => {
+        const manifest = await readManifest();
+        const item = manifest.media.find((entry) => entry.id === mediaId);
+        if (!item || deletingMediaIds.has(mediaId)) throw new Error('The imported media entry was not found in manifest.json.');
+        const metadata = await readMetadata(mediaId);
+        metadata.volume = volume;
+        if (deletingMediaIds.has(mediaId)) throw new Error('The media item is being deleted.');
+        await writeMetadata(mediaId, metadata);
+        return volume;
+    })());
+});
+
+ipcMain.handle('set-media-loop', async (event, mediaId, value) => {
+    const loop = Boolean(value);
+    if (deletingMediaIds.has(mediaId)) throw new Error('The media item is being deleted.');
+    return trackMetadataWrite(mediaId, (async () => {
+        const manifest = await readManifest();
+        const item = manifest.media.find((entry) => entry.id === mediaId);
+        if (!item || deletingMediaIds.has(mediaId)) throw new Error('The imported media entry was not found in manifest.json.');
+        const metadata = await readMetadata(mediaId);
+        metadata.loop = loop;
+        if (deletingMediaIds.has(mediaId)) throw new Error('The media item is being deleted.');
+        await writeMetadata(mediaId, metadata);
+        return loop;
+    })());
 });
 
 ipcMain.handle('set-media-position', async (event, mediaId, value) => {
     const position = Math.max(0, Number(value) || 0);
-    const metadata = await readMetadata(mediaId);
-    metadata.seekPosition = position;
-    await writeMetadata(mediaId, metadata);
-    return position;
+    if (deletingMediaIds.has(mediaId)) throw new Error('The media item is being deleted.');
+    return trackMetadataWrite(mediaId, (async () => {
+        const manifest = await readManifest();
+        const item = manifest.media.find((entry) => entry.id === mediaId);
+        if (!item || deletingMediaIds.has(mediaId)) throw new Error('The imported media entry was not found in manifest.json.');
+        const metadata = await readMetadata(mediaId);
+        metadata.seekPosition = position;
+        if (deletingMediaIds.has(mediaId)) throw new Error('The media item is being deleted.');
+        await writeMetadata(mediaId, metadata);
+        return position;
+    })());
 });
 
 ipcMain.handle('save-transcription', async (event, mediaId, transcription) => {
@@ -945,9 +1537,40 @@ app.whenReady().then(async () => {
     });
     await Promise.all([
         fs.mkdir(mediaDirectory, { recursive: true }),
-        fs.mkdir(captionDirectory, { recursive: true })
+        fs.mkdir(captionDirectory, { recursive: true }),
+        clearUrlDownloadStaging()
     ]);
     createWindow();
 });
 
+let shutdownCleanupStarted = false;
+let shutdownCleanupComplete = false;
+app.on('before-quit', (event) => {
+    if (shutdownCleanupComplete) return;
+    event.preventDefault();
+    if (shutdownCleanupStarted) return;
+    shutdownCleanupStarted = true;
+    activeUrlDownload?.controller.abort();
+
+    const deadline = Date.now() + 12000;
+    const waitForDownloader = () => new Promise((resolve) => {
+        const check = () => {
+            if (!activeUrlDownload?.running || Date.now() >= deadline) resolve();
+            else setTimeout(check, 100);
+        };
+        check();
+    });
+    waitForDownloader()
+        .then(clearUrlDownloadStaging)
+        .catch((error) => console.error('Unable to clear URL download staging during shutdown:', error.message))
+        .finally(() => {
+            shutdownCleanupComplete = true;
+            app.quit();
+        });
+});
+
+app.on('session-end', () => {
+    activeUrlDownload?.controller.abort();
+    clearUrlDownloadStaging().catch(() => {});
+});
 app.on('will-quit', () => globalShortcut.unregisterAll());

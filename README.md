@@ -29,6 +29,8 @@ If you have a built Windows installer, run `Capdio Setup <version>.exe` and foll
 
 Choose **File > Import media**, or press **Ctrl+O**, then select one or more files. Capdio copies them into its library; the original files remain in place.
 
+Choose **File > Download from URL** to import a video from a webpage or direct media URL. Capdio tries `yt-dlp` when it is available, then falls back to inspecting the rendered page and its media requests. FFmpeg handles HLS/DASH streams and combines media when necessary. DRM-protected media is not supported; only download media you are permitted to save.
+
 Supported import extensions:
 
 - Audio: `.mp3`, `.wav`, `.m4a`, `.aac`, `.flac`, `.ogg`
