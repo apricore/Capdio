@@ -284,7 +284,8 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .app-frame:not(.app-frame--dark) .context-menu .context-menu__delete:hover { color: white; background: #c7373d; }
 .app-frame:not(.app-frame--dark) :is(.name-dialog p, .upload-dialog > p, .upload-dialog__queue p) { color: #64748b; }
 .app-frame:not(.app-frame--dark) .name-dialog input { background: #f8faff; border-color: #cbd5e1; }
-.app-frame:not(.app-frame--dark) .name-dialog button:not([type="submit"]):not(.name-dialog__delete) { color: #475569; border-color: #cbd5e1; }
+.app-frame:not(.app-frame--dark) .name-dialog button:not([type="submit"]):not(.name-dialog__delete, .url-download-dialog__cancel) { color: #475569; border-color: #cbd5e1; }
+.app-frame:not(.app-frame--dark) .name-dialog .url-download-dialog__cancel { color: #b42332; border-color: #f0a8ae; background: #fff1f2; }
 .app-frame:not(.app-frame--dark) :is(.upload-dialog code, .upload-dialog__queue div span:last-child) { color: #5148b8; }
 .app-frame:not(.app-frame--dark) :is(.upload-dialog__copy, .upload-dialog__close) { color: #475569; }
 .app-frame:not(.app-frame--dark) :is(.upload-dialog__copy, .upload-dialog__close):hover { background: #e4e9f4; color: #172033; }

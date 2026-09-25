@@ -43,8 +43,9 @@ if (!hasSingleInstanceLock) {
 const runtimeRoot = app.isPackaged ? process.resourcesPath : __dirname;
 const platformBinaryDirectory = path.join(runtimeRoot, 'bin', `${process.platform}-${process.arch}`);
 const bundledDevelopmentPython = path.join(__dirname, '.venv-packaging', 'Scripts', 'python.exe');
+const defaultDevelopmentPython = process.platform === 'win32' ? 'python' : 'python3';
 const developmentPythonExecutable = process.env.CAPDIO_PYTHON
-    || (fsSync.existsSync(bundledDevelopmentPython) ? bundledDevelopmentPython : 'python');
+    || (fsSync.existsSync(bundledDevelopmentPython) ? bundledDevelopmentPython : defaultDevelopmentPython);
 const ffmpegExecutable = app.isPackaged
     ? path.join(platformBinaryDirectory, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
     : (process.env.CAPDIO_FFMPEG || require('ffmpeg-static') || 'ffmpeg');
@@ -499,7 +500,14 @@ function sendUrlDownloadStatus(sender, message) {
 
 function runProcess(executable, arguments_, onLine, timeoutMs = 15 * 60 * 1000, signal = null) {
     return new Promise((resolve, reject) => {
-        const child = spawn(executable, arguments_, { windowsHide: true });
+        const isYtDlp = /^yt-dlp(?:\.exe)?$/i.test(path.basename(executable));
+        const child = spawn(executable, arguments_, {
+            windowsHide: true,
+            // yt-dlp can launch Electron as a Node-compatible JavaScript
+            // runtime for YouTube's player challenges. This also works in the
+            // packaged app, where a separate system Node install may not exist.
+            env: isYtDlp ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : process.env
+        });
         let stderr = '';
         let settled = false;
         let terminationError = null;
@@ -682,6 +690,10 @@ async function findRenderedMedia(pageUrl, sender, signal = null) {
         } catch { /* Ignore malformed URLs exposed by page scripts. */ }
     };
     const inspector = new BrowserWindow({ show: false, width: 1024, height: 720, webPreferences: { sandbox: true, contextIsolation: true } });
+    // Detection pages may autoplay media or advertisements even though their
+    // window is hidden. Mute the complete WebContents before navigation so
+    // HTML media and Web Audio cannot leak sound while the page is inspected.
+    inspector.webContents.setAudioMuted(true);
     const abortInspection = () => { if (!inspector.isDestroyed()) inspector.destroy(); };
     signal?.addEventListener('abort', abortInspection, { once: true });
     const filter = { urls: ['http://*/*', 'https://*/*'] };
@@ -803,6 +815,7 @@ ipcMain.handle('discover-url-media', async (event, rawUrl) => {
             sendUrlDownloadStatus(event.sender, 'Checking the URL with the media extractor…');
             let extractorOutput = '';
             await runProcess(ytDlpExecutable, [
+                '--js-runtimes', `node:${process.execPath}`,
                 '--no-playlist', '--skip-download', '--dump-single-json', '--quiet', '--no-warnings', pageUrl.href
             ], (output) => { extractorOutput += output; }, 60000, controller.signal);
             const info = JSON.parse(extractorOutput.trim());
@@ -897,6 +910,7 @@ ipcMain.handle('download-from-url', async (event, rawUrl, selectedUrls = []) => 
             }
             if (useExtractorSelection) sendUrlDownloadItemStatus(sender, pageUrl.href, 'downloading', { position: 1, total: 1 });
             const extractorArguments = [
+                '--js-runtimes', `node:${process.execPath}`,
                 useExtractorSelection ? '--no-playlist' : '--yes-playlist', '--no-part', '--newline', '--restrict-filenames', '--windows-filenames',
                 '--ffmpeg-location', ffmpegExecutable, '--merge-output-format', 'mp4',
                 '--print-to-file', 'after_move:%(filepath)s', resultListPath,
@@ -1290,7 +1304,7 @@ ipcMain.handle('run-python-test', async () => {
             'test.py'
         );
 
-        const python = spawn('python', [pythonScript]);
+        const python = spawn(developmentPythonExecutable, [pythonScript]);
 
         let stdout = '';
         let stderr = '';

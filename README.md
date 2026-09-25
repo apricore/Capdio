@@ -2,7 +2,7 @@
 
 Capdio is a desktop audio/video library for listening, reading synchronized captions, and looking up unfamiliar words. It combines local Whisper transcription with an interactive caption book and a reusable Youdao dictionary window.
 
-Built with Electron, React, Vite, OpenAI Whisper, and FFmpeg. The included installer pipeline targets **Windows x64**.
+Built with Electron, React, Vite, OpenAI Whisper, and FFmpeg. The included installer pipelines target **Windows x64** and **macOS universal**.
 
 <p align="center">
   <img src="assets/app-window-screenshot-lighttheme.png" alt="Capdio light theme" width="49%">
@@ -12,9 +12,10 @@ Built with Electron, React, Vite, OpenAI Whisper, and FFmpeg. The included insta
 ## Features
 
 - **Media library:** import multiple files, organize them into groups, rename entries, and move selected media by dragging it between groups or into the ungrouped area.
+- **Download from URL:** inspect webpages and direct media links, preview and select detected videos, download multiple items in sequence, and merge adaptive video/audio streams with FFmpeg.
 - **Local transcription:** generate English captions with Whisper's `base` model, view progress, queue multiple files, and cancel or remove queued jobs.
-- **Caption book:** follow the active caption, click a caption to seek and play, and repeat the current segment.
-- **Playback controls:** play/pause, seek, skip five seconds, adjust volume, and use player or video fullscreen.
+- **Caption book:** follow the active caption and click a caption to seek and play.
+- **Playback controls:** play/pause, seek, skip five seconds, adjust volume, loop the current media, allow optional background playback, and use player or video fullscreen.
 - **Remembered settings:** restore the last selected media, saved playback position, per-file volume, theme, sidebar width, and video/caption split sizes.
 - **Phone imports:** scan a QR code to upload audio/video over the same Wi-Fi network, with upload progress and cancellation.
 - **Dictionary lookup:** look up a selection or a whole caption in one reusable Youdao window, with history buttons and keyboard navigation.
@@ -23,13 +24,15 @@ Built with Electron, React, Vite, OpenAI Whisper, and FFmpeg. The included insta
 
 ## Getting started
 
-If you have a built Windows installer, run `Capdio Setup <version>.exe` and follow the installation prompts. The packaged app includes the transcriber, Whisper model, and FFmpeg; end users do not need to install them separately.
+On Windows, run `Capdio Setup <version>.exe` and follow the installation prompts. On macOS, open `Capdio.dmg` and move Capdio into Applications. Packaged builds include the transcriber, Whisper model, FFmpeg, and yt-dlp; end users do not need to install them separately.
 
 ### 1. Import and organize media
 
 Choose **File > Import media**, or press **Ctrl+O**, then select one or more files. Capdio copies them into its library; the original files remain in place.
 
-Choose **File > Download from URL** to import a video from a webpage or direct media URL. Capdio tries `yt-dlp` when it is available, then falls back to inspecting the rendered page and its media requests. FFmpeg handles HLS/DASH streams and combines media when necessary. DRM-protected media is not supported; only download media you are permitted to save.
+Choose **File > Download from URL** to import video from a supported webpage or direct media URL. Capdio first uses its bundled `yt-dlp` extractor, then falls back to inspecting a muted, hidden webpage and its media requests. The detected-media dialog shows available items and video previews where possible, lets you choose which items to download, and reports queued, downloading, importing, completed, or failed states for each item. Completed files are imported into the library one at a time. Downloads and webpage detection can be cancelled; unfinished staging files are cleaned automatically.
+
+FFmpeg handles HLS/DASH streams and combines separate video and audio tracks when necessary. Extractor downloads prefer H.264 video with M4A audio for broad playback compatibility, while retaining a fallback for sites that do not provide those formats. Authentication-protected, expired, geographically restricted, or DRM-protected media may not be downloadable. Only download media you are permitted to save.
 
 Supported import extensions:
 
@@ -55,7 +58,7 @@ The current transcriber uses Whisper's `base` model and explicitly selects **Eng
 ### 3. Listen with the caption book
 
 - Click a caption to jump to that segment and start playback.
-- Enable **Repeat active caption** to practice the current segment.
+- Enable **Loop media** to repeat the entire audio or video file. This choice is saved separately for each library item.
 - Use the timeline, volume slider, and five-second skip controls to navigate.
 - Drag the divider between video and captions to change their proportions; the normal and fullscreen layouts remember their sizes separately.
 - Drag the library divider to resize the sidebar.
@@ -72,7 +75,7 @@ Inside Youdao:
 - **Ctrl+D** returns focus to Capdio.
 - Use the arrow buttons or **Alt+Left / Alt+Right** to traverse window history. Buttons disable when that direction has no available history.
 
-Whenever Capdio loses focus, playing audio/video temporarily pauses while the play/pause button stays in its playing state. Returning to Capdio resumes playback only if losing focus caused the pause; manually paused media stays paused. Closing Capdio also closes Youdao, while either window can be brought to the foreground independently.
+By default, whenever Capdio loses focus, playing audio/video temporarily pauses while the play/pause button stays in its playing state. Returning to Capdio resumes playback only if losing focus caused the pause; manually paused media stays paused. Enable **Settings > Play media in background** to keep playback running while Capdio is unfocused. Closing Capdio also closes Youdao, while either window can be brought to the foreground independently.
 
 Youdao requires an internet connection. Its dark appearance is a local adaptation of a third-party page, so some graphics may differ from their original colors.
 
@@ -107,7 +110,7 @@ The dialog can copy the upload URL and cancel pending uploads. If the phone cann
 
 Media, captions, and metadata are stored locally. Transcription uses the local Whisper runtime; it does not send recordings to a hosted transcription API. Development may download the model on first use; packaged builds include it.
 
-Dictionary lookups send the requested text to Youdao. Phone imports transfer files through a local HTTP server on your computer.
+Dictionary lookups send the requested text to Youdao. URL detection and downloading connect to the supplied webpage and its media hosts. Phone imports transfer files through a local HTTP server on your computer.
 
 During development, the library is stored in `library/` beside `main.js`. Installed builds use the configured library location, falling back to Electron's user-data directory under `library/`.
 
@@ -194,6 +197,23 @@ npm run repackage:win
 
 After Python changes, run the full `npm run dist:win` build. See [PACKAGING.md](PACKAGING.md) for more packaging details.
 
+## Build a macOS universal app
+
+Build the universal macOS DMG on macOS. Prepare native x64 and arm64 Python environments containing `python/requirements-build.txt`, along with an FFmpeg binary for each architecture:
+
+```sh
+export CAPDIO_PYTHON_X64=/path/to/x64/.venv/bin/python
+export CAPDIO_PYTHON_ARM64=/path/to/arm64/.venv/bin/python
+export CAPDIO_FFMPEG_X64=/path/to/x64/ffmpeg
+export CAPDIO_FFMPEG_ARM64=/path/to/arm64/ffmpeg
+export CAPDIO_FFMPEG_LICENSE=/path/to/ffmpeg-static.LICENSE
+export CAPDIO_PYTHON=$CAPDIO_PYTHON_ARM64
+npm ci
+npm run dist:mac
+```
+
+This builds the renderer, stages universal runtime resources and yt-dlp, and creates `release/Capdio.dmg`. After UI or Electron-only changes, use `npm run repackage:mac` to reuse existing staged resources. See [PACKAGING.md](PACKAGING.md) for architecture and environment details.
+
 | Command | Purpose |
 | --- | --- |
 | `npm run dev` | Start the Vite development server |
@@ -201,21 +221,24 @@ After Python changes, run the full `npm run dist:win` build. See [PACKAGING.md](
 | `npm run build` | Build the React renderer |
 | `npm run build:python` | Bundle the Python transcriber with cx_Freeze |
 | `npm run download:model` | Stage the Whisper model |
-| `npm run package:resources` | Build the transcriber and stage the model |
+| `npm run package:resources` | Build the Windows transcriber and stage the model and yt-dlp |
+| `npm run package:resources:mac` | Build universal macOS runtime resources and stage the model and yt-dlp |
 | `npm run dist:win` | Build the complete Windows installer |
 | `npm run repackage:win` | Rebuild the renderer and installer using existing runtime resources |
+| `npm run dist:mac` | Build the complete universal macOS DMG |
+| `npm run repackage:mac` | Rebuild the renderer and universal macOS DMG using existing runtime resources |
 
 ## Project structure
 
 | Path | Purpose |
 | --- | --- |
-| `main.js` | Electron lifecycle, library storage, IPC, imports, uploads, and transcription processes |
+| `main.js` | Electron lifecycle, library storage, IPC, URL/phone imports, downloads, and transcription processes |
 | `src/App.jsx` | Library UI, menus, queues, settings, and app shortcuts |
 | `src/MediaPlayer.jsx` | Playback and interactive caption book |
 | `dictionary.js` | Youdao window, lookup, navigation, theme injection, and shortcuts |
 | `dictionary.html` | Custom dictionary title bar and window controls |
 | `python/transcribe.py` | Local Whisper transcription |
-| `scripts/` | Python packaging and model staging |
+| `scripts/` | Python packaging, model staging, yt-dlp staging, and macOS universal-resource assembly |
 | `installer.nsh` | Windows installer customization |
 
 Generated libraries, model files, Python binaries, and installers are ignored by Git.
