@@ -41,11 +41,13 @@ export default function MediaPlayer({
   queued = false,
   transcriptionProgress = 0,
   onTranscribe,
+  onCancelTranscription,
   volume = 1,
   loop = false,
   volumeRevealRequest = 0,
   playbackToggleRequest = 0,
   playbackSeekRequest = { sequence: 0, seconds: 0 },
+  loopToggleRequest = 0,
   onVolumeChange,
   onLoopChange,
   onToggleTheme,
@@ -72,6 +74,7 @@ export default function MediaPlayer({
   const handledVolumeRevealRequestRef = useRef(volumeRevealRequest);
   const handledPlaybackToggleRequestRef = useRef(playbackToggleRequest);
   const handledPlaybackSeekRequestRef = useRef(playbackSeekRequest.sequence);
+  const handledLoopToggleRequestRef = useRef(loopToggleRequest);
   const onPositionChangeRef = useRef(onPositionChange);
   onPositionChangeRef.current = onPositionChange;
   const [currentTime, setCurrentTime] = useState(0);
@@ -160,6 +163,12 @@ export default function MediaPlayer({
     handledPlaybackSeekRequestRef.current = playbackSeekRequest.sequence;
     seek(currentTime + playbackSeekRequest.seconds);
   }, [playbackSeekRequest, currentTime]);
+
+  useEffect(() => {
+    if (loopToggleRequest === handledLoopToggleRequestRef.current) return;
+    handledLoopToggleRequestRef.current = loopToggleRequest;
+    toggleLoop();
+  }, [loopToggleRequest]);
 
   useEffect(() => {
     if (fullscreenRequest === handledFullscreenRequestRef.current) return;
@@ -298,6 +307,12 @@ export default function MediaPlayer({
     }
   }
 
+  function toggleLoop() {
+    const next = !loopEnabled;
+    setLoopEnabled(next);
+    onLoopChange?.(next);
+  }
+
   function handleVideoPointerDown() {
     // Native focus can arrive just before or after the activating pointer event.
     videoClickRestoresFocusRef.current = !windowFocusedRef.current
@@ -381,7 +396,7 @@ export default function MediaPlayer({
             <p>{entry.t}</p>
           </article>
         ))}
-        {!entries.length && <div className="media-player__empty"><p>No captions yet.</p>{!hasCaptions && (transcribing ? <div className="media-player__transcription-status"><span>Transcribing… {transcriptionProgress}%</span><progress value={transcriptionProgress} max="100">{transcriptionProgress}%</progress></div> : queued ? <p className="media-player__queue-status">Queued for transcription.</p> : <button type="button" onClick={onTranscribe}>Transcribe</button>)}</div>}
+        {!entries.length && <div className="media-player__empty">{transcribing ? <button className="media-player__cancel-transcription" type="button" onClick={onCancelTranscription}>Cancel transcription</button> : <p>No captions yet.</p>}{!hasCaptions && (transcribing ? <div className="media-player__transcription-status"><span>Transcribing… {transcriptionProgress}%</span><progress value={transcriptionProgress} max="100">{transcriptionProgress}%</progress></div> : queued ? <p className="media-player__queue-status">Queued for transcription.</p> : <button type="button" onClick={onTranscribe}>Transcribe</button>)}</div>}
       </div>
 
       <footer className="media-player__controls">
@@ -389,7 +404,7 @@ export default function MediaPlayer({
         <div className="media-player__times"><span>{secondsToTimestamp(currentTime).slice(0, -2)}</span><span>{secondsToTimestamp(duration).slice(0, -2)}</span></div>
         <div className="media-player__buttons">
           <label className={`media-player__volume ${volumeExpanded ? 'is-expanded' : ''}`} title={`Volume ${Math.round(volume * 100)}%`} onPointerEnter={() => { volumeHoveringRef.current = true; }} onPointerLeave={handleVolumePointerLeave}><Volume2 /><input aria-label="Volume" type="range" min="0" max="1" step="0.01" value={volume} onChange={(event) => onVolumeChange?.(Number(event.target.value))} /></label>
-          <button type="button" title="Loop media" aria-label="Loop media" aria-pressed={loopEnabled} className={loopEnabled ? 'is-on' : ''} onClick={() => { const next = !loopEnabled; setLoopEnabled(next); onLoopChange?.(next); }}><Repeat2 /></button>
+          <button type="button" title="Loop media (Ctrl+R)" aria-label="Loop media" aria-pressed={loopEnabled} className={loopEnabled ? 'is-on' : ''} onClick={toggleLoop}><Repeat2 /></button>
           <button type="button" title="Back 5 seconds" aria-label="Back 5 seconds" onClick={() => seek(currentTime - 5)}><SkipBack /></button>
           <button type="button" className="media-player__play" aria-label={isPlaying ? 'Pause' : 'Play'} onClick={togglePlayback}>{isPlaying ? <Pause /> : <Play />}</button>
           <button type="button" title="Forward 5 seconds" aria-label="Forward 5 seconds" onClick={() => seek(currentTime + 5)}><SkipForward /></button>

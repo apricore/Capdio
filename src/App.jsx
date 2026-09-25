@@ -31,6 +31,7 @@ function App() {
   const [captions, setCaptions] = useState([]);
   const [status, setStatus] = useState('Loading library...');
   const [progress, setProgress] = useState(0);
+  const [audioExtraction, setAudioExtraction] = useState(null);
   const [isImporting, setIsImporting] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcribingMediaId, setTranscribingMediaId] = useState(null);
@@ -69,12 +70,14 @@ function App() {
   const [mediaWasPlaying, setMediaWasPlaying] = useState(false);
   const [autoplayNext, setAutoplayNext] = useState(false);
   const [playbackToggleRequest, setPlaybackToggleRequest] = useState(0);
+  const [loopToggleRequest, setLoopToggleRequest] = useState(0);
   const [playbackSeekRequest, setPlaybackSeekRequest] = useState({ sequence: 0, seconds: 0 });
   const [volumeRevealRequest, setVolumeRevealRequest] = useState(0);
   const libraryRef = useRef([]);
   const transcriptionQueueRef = useRef([]);
   const isQueueRunningRef = useRef(false);
   const activeTranscriptionRef = useRef(null);
+  const activeAudioExtractionRef = useRef(null);
   const volumeSaveTimerRef = useRef(null);
   const positionSaveTimersRef = useRef(new Map());
   const currentPositionRef = useRef(0);
@@ -170,6 +173,10 @@ function App() {
       if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 't') {
         event.preventDefault();
         setDarkTheme((value) => !value);
+      }
+      if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'r') {
+        event.preventDefault();
+        if (media && !event.repeat) setLoopToggleRequest((value) => value + 1);
       }
       const target = event.target;
       const isEditingText = target instanceof HTMLElement && (target.matches('input, textarea, [contenteditable="true"]') || target.isContentEditable);
@@ -318,6 +325,11 @@ function App() {
     loadLibrary(true);
     const onProgress = (_event, value) => setProgress(Math.round(value * 100));
     const onStatus = (_event, message) => setStatus(message);
+    const onAudioExtractionProgress = (_event, update) => {
+      if (activeAudioExtractionRef.current !== update.mediaId) return;
+      setAudioExtraction({ mediaId: update.mediaId, progress: update.progress });
+      setStatus(`Extracting audio... ${update.progress}%`);
+    };
     const onUploadStatus = (_event, update) => {
       if (Number.isFinite(update.queued)) setUploadQueueSize(update.queued);
       setUploads((uploads) => {
@@ -345,6 +357,7 @@ function App() {
     };
     ipcRenderer.on('transcription-progress', onProgress);
     ipcRenderer.on('transcription-status', onStatus);
+    ipcRenderer.on('audio-extraction-progress', onAudioExtractionProgress);
     ipcRenderer.on('upload-status', onUploadStatus);
     ipcRenderer.on('url-download-status', onUrlDownloadStatus);
     ipcRenderer.on('url-download-imported', onUrlDownloadImported);
@@ -352,6 +365,7 @@ function App() {
     return () => {
       ipcRenderer.removeListener('transcription-progress', onProgress);
       ipcRenderer.removeListener('transcription-status', onStatus);
+      ipcRenderer.removeListener('audio-extraction-progress', onAudioExtractionProgress);
       ipcRenderer.removeListener('upload-status', onUploadStatus);
       ipcRenderer.removeListener('url-download-status', onUrlDownloadStatus);
       ipcRenderer.removeListener('url-download-imported', onUrlDownloadImported);
@@ -653,6 +667,39 @@ function App() {
       window.alert(`Could not export media: ${error.message}`);
     }
   }
+  async function extractAudio(item) {
+    setContextMenu(null);
+    activeAudioExtractionRef.current = item.id;
+    setAudioExtraction({ mediaId: item.id, progress: 0 });
+    setStatus(`Extracting audio from ${item.name}...`);
+    try {
+      const extracted = await ipcRenderer.invoke('extract-audio', item.id);
+      if (extracted.cancelled) {
+        setStatus(`Cancelled audio extraction from ${item.name}.`);
+        return;
+      }
+      setLibrary((items) => [...items, extracted]);
+      if (extracted.groupId) setExpandedGroups((groups) => new Set([...groups, extracted.groupId]));
+      setStatus(`Extracted audio from ${item.name}.`);
+    } catch (error) {
+      setStatus(error.message);
+      if (!/cancelled/i.test(error.message)) window.alert(error.message);
+    } finally {
+      activeAudioExtractionRef.current = null;
+      setAudioExtraction(null);
+    }
+  }
+  async function cancelAudioExtraction(item) {
+    setContextMenu(null);
+    setStatus(`Cancelling audio extraction from ${item.name}...`);
+    activeAudioExtractionRef.current = null;
+    setAudioExtraction(null);
+    try {
+      await ipcRenderer.invoke('cancel-audio-extraction', item.id);
+    } catch (error) {
+      setStatus(`Could not cancel audio extraction: ${error.message}`);
+    }
+  }
   function createGroup() {
     setNameDialog({ mode: 'create-group', title: 'New group', value: '' });
   }
@@ -867,12 +914,12 @@ function App() {
           </section>
           {!library.length && <p className="side-nav__empty">Your manifest has no media yet.</p>}
         </nav>
-        <LibraryTree library={library} groups={groups} selectedIds={selectedIds} activeId={media?.id} expandedGroups={expandedGroups} dragTargetGroup={dragTargetGroup} inlineRename={inlineRename} transcribingMediaId={transcribingMediaId} queuedTranscriptionIds={queuedTranscriptionIds} transcriptionProgress={progress} onRenameChange={setInlineRename} onRenameCommit={commitInlineRename} onSelect={selectMedia} onContextMenu={showContextMenu} onDragStart={startMediaDrag} onToggleGroup={toggleGroup} onDragTarget={setDragTargetGroup} onDrop={handleGroupDrop} />
+        <LibraryTree library={library} groups={groups} selectedIds={selectedIds} activeId={media?.id} expandedGroups={expandedGroups} dragTargetGroup={dragTargetGroup} inlineRename={inlineRename} transcribingMediaId={transcribingMediaId} queuedTranscriptionIds={queuedTranscriptionIds} transcriptionProgress={progress} audioExtraction={audioExtraction} onRenameChange={setInlineRename} onRenameCommit={commitInlineRename} onSelect={selectMedia} onContextMenu={showContextMenu} onDragStart={startMediaDrag} onToggleGroup={toggleGroup} onDragTarget={setDragTargetGroup} onDrop={handleGroupDrop} />
       </aside>
       <div className="side-nav__resize-handle" role="separator" aria-label="Resize media library" aria-orientation="vertical" onPointerDown={beginSideNavResize} />
 
       <section className="workspace">
-        {media && <MediaPlayer key={media.id} mediaId={media.id} src={media.playbackPath || `library/${media.media}`} captions={captions} hasCaptions={Boolean(media.caption)} volume={media.volume ?? 1} loop={Boolean(media.loop)} volumeRevealRequest={volumeRevealRequest} playbackToggleRequest={playbackToggleRequest} playbackSeekRequest={playbackSeekRequest} initialPosition={media.seekPosition ?? 0} autoplay={autoplayNext} onPlayingChange={setMediaWasPlaying} onCurrentPosition={(mediaId, value) => { if (activeMediaRef.current?.id === mediaId) currentPositionRef.current = value; }} onPositionChange={saveMediaPosition} dark={darkTheme} showMedia={media.type !== 'audio'} playInBackground={playMediaInBackground} fullscreenRequest={playerFullscreenRequest} videoFullscreenRequest={videoFullscreenRequest} transcribing={transcribingMediaId === media.id} queued={queuedTranscriptionIds.has(media.id)} transcriptionProgress={progress} onTranscribe={transcribeMedia} onVolumeChange={saveMediaVolume} onLoopChange={saveMediaLoop} onToggleTheme={() => setDarkTheme((value) => !value)} />}
+        {media && <MediaPlayer key={media.id} mediaId={media.id} src={media.playbackPath || `library/${media.media}`} captions={captions} hasCaptions={Boolean(media.caption)} volume={media.volume ?? 1} loop={Boolean(media.loop)} volumeRevealRequest={volumeRevealRequest} playbackToggleRequest={playbackToggleRequest} playbackSeekRequest={playbackSeekRequest} loopToggleRequest={loopToggleRequest} initialPosition={media.seekPosition ?? 0} autoplay={autoplayNext} onPlayingChange={setMediaWasPlaying} onCurrentPosition={(mediaId, value) => { if (activeMediaRef.current?.id === mediaId) currentPositionRef.current = value; }} onPositionChange={saveMediaPosition} dark={darkTheme} showMedia={media.type !== 'audio'} playInBackground={playMediaInBackground} fullscreenRequest={playerFullscreenRequest} videoFullscreenRequest={videoFullscreenRequest} transcribing={transcribingMediaId === media.id} queued={queuedTranscriptionIds.has(media.id)} transcriptionProgress={progress} onTranscribe={transcribeMedia} onCancelTranscription={cancelTranscription} onVolumeChange={saveMediaVolume} onLoopChange={saveMediaLoop} onToggleTheme={() => setDarkTheme((value) => !value)} />}
       </section>
       </div>
       {contextMenu && <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>
@@ -886,6 +933,8 @@ function App() {
         {contextMenu.type === 'root' && <button type="button" disabled={!contextScopeHasEligibleTranscription} onClick={() => { transcribeUngrouped(); setContextMenu(null); }}>Transcribe all</button>}
         {contextMenu.type === 'root' && contextScopeHasTranscribing && <button type="button" onClick={() => { cancelUngroupedTranscriptions(); setContextMenu(null); }}>Cancel all transcriptions</button>}
         {contextMenu.type === 'media' && <button type="button" onClick={() => exportMedia(contextMenu.item)}>Export</button>}
+        {contextMenu.type === 'media' && contextMenu.item.type !== 'audio' && audioExtraction?.mediaId === contextMenu.item.id && <button type="button" onClick={() => cancelAudioExtraction(contextMenu.item)}>Cancel extracting audio</button>}
+        {contextMenu.type === 'media' && contextMenu.item.type !== 'audio' && audioExtraction?.mediaId !== contextMenu.item.id && <button type="button" disabled={Boolean(audioExtraction)} onClick={() => extractAudio(contextMenu.item)}>Extract audio</button>}
         {contextMenu.type === 'media' && transcribingMediaId === contextMenu.item.id && <button type="button" onClick={() => { cancelTranscription(); setContextMenu(null); }}>Cancel transcription</button>}
         {contextMenu.type === 'media' && transcribingMediaId !== contextMenu.item.id && queuedTranscriptionIds.has(contextMenu.item.id) && <button type="button" onClick={() => { dequeueTranscription(contextMenu.item.id); setContextMenu(null); }}>Dequeue / Exclude</button>}
         {contextMenu.type === 'media' && transcribingMediaId !== contextMenu.item.id && !queuedTranscriptionIds.has(contextMenu.item.id) && <button type="button" disabled={Boolean(contextMenu.item.caption)} onClick={() => { enqueueFromTarget(contextMenu.item); setContextMenu(null); }}>{contextMenu.item.caption ? 'Transcribed' : 'Transcribe'}</button>}
@@ -920,7 +969,7 @@ function App() {
   );
 }
 
-function LibraryTree({ library, groups, selectedIds, activeId, expandedGroups, dragTargetGroup, inlineRename, transcribingMediaId, queuedTranscriptionIds, transcriptionProgress, onRenameChange, onRenameCommit, onSelect, onContextMenu, onDragStart, onToggleGroup, onDragTarget, onDrop }) {
+function LibraryTree({ library, groups, selectedIds, activeId, expandedGroups, dragTargetGroup, inlineRename, transcribingMediaId, queuedTranscriptionIds, transcriptionProgress, audioExtraction, onRenameChange, onRenameCommit, onSelect, onContextMenu, onDragStart, onToggleGroup, onDragTarget, onDrop }) {
   const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
   const isRenaming = Boolean(inlineRename);
   return <nav className={`side-nav__items ${dragTargetGroup === 'root' ? 'is-root-drop-target' : ''}`} onContextMenu={(event) => { if (event.target === event.currentTarget) onContextMenu(event, 'root', null); }} onDragOver={(event) => { if (isRenaming) return; event.preventDefault(); onDragTarget('root'); }} onDragLeave={(event) => { if (!isRenaming && !event.currentTarget.contains(event.relatedTarget)) onDragTarget(null); }} onDrop={(event) => { if (isRenaming) return; onDrop(event, null); }}>
@@ -929,10 +978,10 @@ function LibraryTree({ library, groups, selectedIds, activeId, expandedGroups, d
       const groupMedia = library.filter((item) => item.groupId === group.id).sort(byName);
       return <section key={group.id} className={`side-nav__group ${dragTargetGroup === group.id ? 'is-drop-target' : ''}`} onContextMenu={(event) => onContextMenu(event, 'group', group)} onDragOver={(event) => { if (isRenaming) return; event.preventDefault(); event.stopPropagation(); onDragTarget(group.id); }} onDragLeave={(event) => { if (!isRenaming && !event.currentTarget.contains(event.relatedTarget)) onDragTarget(null); }} onDrop={(event) => { if (isRenaming) return; event.stopPropagation(); onDrop(event, group.id); }}>
         <div className={`side-nav__group-name ${expanded ? 'is-open' : ''}`} role="button" tabIndex={0} onClick={() => onToggleGroup(group.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onToggleGroup(group.id); } }} aria-expanded={expanded}><span className="side-nav__folder" aria-hidden="true">{expanded ? <FolderOpen /> : <Folder />}</span>{inlineRename?.type === 'group' && inlineRename.id === group.id ? <InlineName className="side-nav__name side-nav__group-label" rename={inlineRename} onChange={onRenameChange} onCommit={onRenameCommit} /> : <span className="side-nav__name side-nav__group-label">{group.name}</span>}<span className="side-nav__group-count">{groupMedia.length}</span></div>
-        <div className={`side-nav__group-content ${expanded ? 'is-expanded' : ''}`}><div>{groupMedia.map((item) => <MediaItem key={item.id} item={item} selected={selectedIds.has(item.id)} active={activeId === item.id} inlineRename={inlineRename} transcribing={transcribingMediaId === item.id} queued={queuedTranscriptionIds.has(item.id)} progress={transcriptionProgress} onRenameChange={onRenameChange} onRenameCommit={onRenameCommit} onSelect={onSelect} onContextMenu={onContextMenu} onDragStart={onDragStart} onDragEnd={() => onDragTarget(null)} />)}</div></div>
+        <div className={`side-nav__group-content ${expanded ? 'is-expanded' : ''}`}><div>{groupMedia.map((item) => <MediaItem key={item.id} item={item} selected={selectedIds.has(item.id)} active={activeId === item.id} inlineRename={inlineRename} transcribing={transcribingMediaId === item.id} queued={queuedTranscriptionIds.has(item.id)} progress={transcriptionProgress} extractionProgress={audioExtraction?.mediaId === item.id ? audioExtraction.progress : null} onRenameChange={onRenameChange} onRenameCommit={onRenameCommit} onSelect={onSelect} onContextMenu={onContextMenu} onDragStart={onDragStart} onDragEnd={() => onDragTarget(null)} />)}</div></div>
       </section>;
     })}
-    {library.filter((item) => !item.groupId).sort(byName).map((item) => <MediaItem key={item.id} item={item} selected={selectedIds.has(item.id)} active={activeId === item.id} inlineRename={inlineRename} transcribing={transcribingMediaId === item.id} queued={queuedTranscriptionIds.has(item.id)} progress={transcriptionProgress} onRenameChange={onRenameChange} onRenameCommit={onRenameCommit} onSelect={onSelect} onContextMenu={onContextMenu} onDragStart={onDragStart} onDragEnd={() => onDragTarget(null)} />)}
+    {library.filter((item) => !item.groupId).sort(byName).map((item) => <MediaItem key={item.id} item={item} selected={selectedIds.has(item.id)} active={activeId === item.id} inlineRename={inlineRename} transcribing={transcribingMediaId === item.id} queued={queuedTranscriptionIds.has(item.id)} progress={transcriptionProgress} extractionProgress={audioExtraction?.mediaId === item.id ? audioExtraction.progress : null} onRenameChange={onRenameChange} onRenameCommit={onRenameCommit} onSelect={onSelect} onContextMenu={onContextMenu} onDragStart={onDragStart} onDragEnd={() => onDragTarget(null)} />)}
     {!library.length && <p className="side-nav__empty">Your manifest has no media yet.</p>}
   </nav>;
 }
@@ -954,11 +1003,12 @@ function InlineName({ className, rename, onChange, onCommit }) {
   return <span ref={editorRef} className={`${className || ''} side-nav__rename-editor`.trim()} contentEditable suppressContentEditableWarning tabIndex={0} onBlur={(event) => onCommit(event.currentTarget.textContent)} onKeyDown={(event) => { event.stopPropagation(); if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); } if (event.key === 'Escape') { onChange(null); event.currentTarget.blur(); } }} onClick={(event) => event.stopPropagation()}>{rename.value}</span>;
 }
 
-function MediaItem({ item, selected, active, inlineRename, transcribing, queued, progress, onRenameChange, onRenameCommit, onSelect, onContextMenu, onDragStart, onDragEnd }) {
+function MediaItem({ item, selected, active, inlineRename, transcribing, queued, progress, extractionProgress, onRenameChange, onRenameCommit, onSelect, onContextMenu, onDragStart, onDragEnd }) {
   return <div draggable={!inlineRename} key={item.id} role="button" aria-current={active ? 'true' : undefined} aria-pressed={selected} className={`side-nav__item ${active ? 'is-selected' : ''} ${selected ? 'is-multi-selected' : ''}`} onClick={(event) => { if (inlineRename?.type === 'media' && inlineRename.id === item.id) return; onSelect(item, event); }} onContextMenu={(event) => onContextMenu(event, 'media', item)} onDragStart={(event) => { if (inlineRename) { event.preventDefault(); return; } if (onDragStart) onDragStart(event, item); else event.dataTransfer.setData('text/media-id', item.id); }} onDragEnd={onDragEnd}>
     <span className={`side-nav__media-icon side-nav__media-icon--${item.type || 'video'}`} aria-hidden="true">{item.type === 'audio' ? <Music /> : <Video />}</span>
     {inlineRename?.type === 'media' && inlineRename.id === item.id ? <InlineName className="side-nav__name" rename={inlineRename} onChange={onRenameChange} onCommit={onRenameCommit} /> : <span className="side-nav__name">{item.name}</span>}
     {transcribing && <span className="side-nav__transcription-progress" style={{ '--progress': `${progress}%` }}>{progress}%</span>}
+    {!transcribing && extractionProgress !== null && extractionProgress !== undefined && <span className="side-nav__transcription-progress side-nav__extraction-progress" title="Extracting audio" style={{ '--progress': `${extractionProgress}%` }}>{extractionProgress}%</span>}
     {!transcribing && queued && <span className="side-nav__transcription-queued">Queued</span>}
     {!transcribing && item.caption && <Check className="side-nav__caption-check" aria-label="Captions available" />}
   </div>;

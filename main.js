@@ -43,8 +43,9 @@ if (!hasSingleInstanceLock) {
 const runtimeRoot = app.isPackaged ? process.resourcesPath : __dirname;
 const platformBinaryDirectory = path.join(runtimeRoot, 'bin', `${process.platform}-${process.arch}`);
 const bundledDevelopmentPython = path.join(__dirname, '.venv-packaging', 'Scripts', 'python.exe');
+const defaultDevelopmentPython = process.platform === 'win32' ? 'python' : 'python3';
 const developmentPythonExecutable = process.env.CAPDIO_PYTHON
-    || (fsSync.existsSync(bundledDevelopmentPython) ? bundledDevelopmentPython : 'python');
+    || (fsSync.existsSync(bundledDevelopmentPython) ? bundledDevelopmentPython : defaultDevelopmentPython);
 const ffmpegExecutable = app.isPackaged
     ? path.join(platformBinaryDirectory, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
     : (process.env.CAPDIO_FFMPEG || require('ffmpeg-static') || 'ffmpeg');
@@ -499,7 +500,14 @@ function sendUrlDownloadStatus(sender, message) {
 
 function runProcess(executable, arguments_, onLine, timeoutMs = 15 * 60 * 1000, signal = null) {
     return new Promise((resolve, reject) => {
-        const child = spawn(executable, arguments_, { windowsHide: true });
+        const isYtDlp = /^yt-dlp(?:\.exe)?$/i.test(path.basename(executable));
+        const child = spawn(executable, arguments_, {
+            windowsHide: true,
+            // yt-dlp can launch Electron as a Node-compatible JavaScript
+            // runtime for YouTube's player challenges. This also works in the
+            // packaged app, where a separate system Node install may not exist.
+            env: isYtDlp ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : process.env
+        });
         let stderr = '';
         let settled = false;
         let terminationError = null;
@@ -682,6 +690,10 @@ async function findRenderedMedia(pageUrl, sender, signal = null) {
         } catch { /* Ignore malformed URLs exposed by page scripts. */ }
     };
     const inspector = new BrowserWindow({ show: false, width: 1024, height: 720, webPreferences: { sandbox: true, contextIsolation: true } });
+    // Detection pages may autoplay media or advertisements even though their
+    // window is hidden. Mute the complete WebContents before navigation so
+    // HTML media and Web Audio cannot leak sound while the page is inspected.
+    inspector.webContents.setAudioMuted(true);
     const abortInspection = () => { if (!inspector.isDestroyed()) inspector.destroy(); };
     signal?.addEventListener('abort', abortInspection, { once: true });
     const filter = { urls: ['http://*/*', 'https://*/*'] };
@@ -803,6 +815,7 @@ ipcMain.handle('discover-url-media', async (event, rawUrl) => {
             sendUrlDownloadStatus(event.sender, 'Checking the URL with the media extractor…');
             let extractorOutput = '';
             await runProcess(ytDlpExecutable, [
+                '--js-runtimes', `node:${process.execPath}`,
                 '--no-playlist', '--skip-download', '--dump-single-json', '--quiet', '--no-warnings', pageUrl.href
             ], (output) => { extractorOutput += output; }, 60000, controller.signal);
             const info = JSON.parse(extractorOutput.trim());
@@ -897,6 +910,7 @@ ipcMain.handle('download-from-url', async (event, rawUrl, selectedUrls = []) => 
             }
             if (useExtractorSelection) sendUrlDownloadItemStatus(sender, pageUrl.href, 'downloading', { position: 1, total: 1 });
             const extractorArguments = [
+                '--js-runtimes', `node:${process.execPath}`,
                 useExtractorSelection ? '--no-playlist' : '--yes-playlist', '--no-part', '--newline', '--restrict-filenames', '--windows-filenames',
                 '--ffmpeg-location', ffmpegExecutable, '--merge-output-format', 'mp4',
                 '--print-to-file', 'after_move:%(filepath)s', resultListPath,
@@ -1236,50 +1250,120 @@ function secondsToTimestamp(seconds) {
     return `${minutes}:${Math.floor(remainder / 10)}:${remainder % 10}`;
 }
 
-ipcMain.handle('extract-audio', async (event, inputFile) => {
-    return new Promise((resolve, reject) => {
-        const outputFile = path.join(
-            path.dirname(inputFile),
-            `${path.parse(inputFile).name}_audio.wav`
-        );
+const activeAudioExtractions = new Map();
+const pendingAudioExtractionCancellations = new Set();
 
-        console.log('FFmpeg input:', inputFile);
-        console.log('FFmpeg output:', outputFile);
+ipcMain.handle('extract-audio', async (event, mediaId) => {
+    const manifest = await readManifest();
+    const sourceItem = manifest.media.find((item) => item.id === mediaId);
+    if (!sourceItem) throw new Error('The video was not found.');
+    if (sourceItem.type === 'audio') throw new Error('Audio can only be extracted from a video.');
+    if (activeAudioExtractions.has(mediaId)) throw new Error('Audio extraction is already running for this video.');
 
-        const ffmpeg = spawn(ffmpegExecutable, [
-            '-y',
-            '-i', inputFile,
-            '-vn',
-            '-ac', '1',
-            '-ar', '16000',
-            '-c:a', 'pcm_s16le',
+    const sourceMetadata = await readMetadata(sourceItem.id);
+    const controller = new AbortController();
+    activeAudioExtractions.set(mediaId, controller);
+    if (pendingAudioExtractionCancellations.delete(mediaId)) controller.abort();
+    const id = crypto.randomUUID();
+    const extension = '.m4a';
+    const outputFile = path.join(mediaDirectory, `${id}${extension}`);
+    const sourceCaptionFile = captionPathFor(sourceItem);
+    const outputCaptionFile = path.join(captionDirectory, `${id}.captions.json`);
+    const sendProgress = (value) => {
+        if (!controller.signal.aborted && !event.sender.isDestroyed()) event.sender.send('audio-extraction-progress', {
+            mediaId,
+            progress: Math.max(0, Math.min(100, Math.round(value)))
+        });
+    };
+
+    await fs.mkdir(mediaDirectory, { recursive: true });
+    try {
+        controller.signal.throwIfAborted();
+        let ffmpegOutput = '';
+        let durationSeconds = 0;
+        sendProgress(0);
+        await runProcess(ffmpegExecutable, [
+            '-y', '-i', mediaPathFor(sourceItem),
+            '-map', '0:a:0', '-vn',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-progress', 'pipe:1', '-stats_period', '0.25', '-nostats',
             outputFile
-        ]);
-
-        let stderr = '';
-
-        ffmpeg.stderr.on('data', (data) => {
-            stderr += data.toString();
-
-            console.log(data.toString());
-        });
-
-        ffmpeg.on('error', (error) => {
-            reject(error);
-        });
-
-        ffmpeg.on('close', (code) => {
-            if (code === 0) {
-                resolve(outputFile);
-            } else {
-                reject(
-                    new Error(
-                        `FFmpeg exited with code ${code}\n${stderr}`
-                    )
-                );
+        ], (output) => {
+            ffmpegOutput = `${ffmpegOutput}${output}`.slice(-20000);
+            const duration = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(ffmpegOutput);
+            if (duration) durationSeconds = Number(duration[1]) * 3600 + Number(duration[2]) * 60 + Number(duration[3]);
+            const elapsed = [...ffmpegOutput.matchAll(/out_time=(\d+):(\d+):(\d+(?:\.\d+)?)/g)].at(-1);
+            if (durationSeconds > 0 && elapsed) {
+                const elapsedSeconds = Number(elapsed[1]) * 3600 + Number(elapsed[2]) * 60 + Number(elapsed[3]);
+                sendProgress(Math.min(99, elapsedSeconds / durationSeconds * 100));
             }
+        }, 15 * 60 * 1000, controller.signal);
+        controller.signal.throwIfAborted();
+
+        const item = {
+            id,
+            type: 'audio',
+            extension,
+            importedAt: new Date().toISOString()
+        };
+        let copiedCaptions = [];
+        let hasCopiedCaptions = false;
+        try {
+            const sourceCaption = JSON.parse(await fs.readFile(sourceCaptionFile, 'utf8'));
+            const copiedCaption = {
+                ...sourceCaption,
+                media: id
+            };
+            copiedCaptions = Array.isArray(copiedCaption.captions) ? copiedCaption.captions : [];
+            await fs.mkdir(captionDirectory, { recursive: true });
+            await fs.writeFile(outputCaptionFile, `${JSON.stringify(copiedCaption, null, 2)}\n`);
+            hasCopiedCaptions = true;
+            if (sourceItem.transcribedAt) item.transcribedAt = sourceItem.transcribedAt;
+        } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+        }
+        await writeMetadata(id, {
+            name: sourceMetadata.name,
+            groupId: sourceMetadata.groupId ?? null,
+            volume: 1,
+            loop: false
         });
-    });
+        controller.signal.throwIfAborted();
+        manifest.media.push(item);
+        await writeManifest(manifest);
+        return {
+            ...item,
+            absolutePath: outputFile,
+            playbackPath: `capdio://library/media/${id}${extension}`,
+            media: `media/${id}${extension}`,
+            caption: hasCopiedCaptions ? `caption/${id}.captions.json` : null,
+            captions: copiedCaptions,
+            name: sourceMetadata.name,
+            groupId: sourceMetadata.groupId ?? null,
+            volume: 1,
+            loop: false
+        };
+    } catch (error) {
+        await Promise.all([
+            fs.unlink(outputFile).catch(() => {}),
+            fs.unlink(metadataPath(id)).catch(() => {}),
+            fs.unlink(outputCaptionFile).catch(() => {})
+        ]);
+        if (controller.signal.aborted) return { cancelled: true };
+        throw new Error(`Could not extract audio: ${error.message}`);
+    } finally {
+        if (activeAudioExtractions.get(mediaId) === controller) activeAudioExtractions.delete(mediaId);
+    }
+});
+
+ipcMain.handle('cancel-audio-extraction', (event, mediaId) => {
+    const controller = activeAudioExtractions.get(mediaId);
+    if (!controller) {
+        pendingAudioExtractionCancellations.add(mediaId);
+        return true;
+    }
+    controller.abort();
+    return true;
 });
 
 ipcMain.handle('run-python-test', async () => {
@@ -1290,7 +1374,7 @@ ipcMain.handle('run-python-test', async () => {
             'test.py'
         );
 
-        const python = spawn('python', [pythonScript]);
+        const python = spawn(developmentPythonExecutable, [pythonScript]);
 
         let stdout = '';
         let stderr = '';

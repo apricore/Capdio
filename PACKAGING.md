@@ -1,4 +1,4 @@
-# Packaging Capdio for Windows
+# Packaging Capdio
 
 Capdio's Windows installer includes Electron, FFmpeg, a bundled Whisper
 transcriber, and the Whisper `base` model. End users do not need Python,
@@ -47,8 +47,27 @@ The generated runtime resources are intentionally ignored by Git:
 
 The build regenerates all ignored packaging resources, so a fresh clone does
 not need the `resources/` or `release/` directories from another machine.
-Each target platform/architecture needs its own build. The included pipeline
-targets Windows x64.
+
+## macOS universal installer
+
+Build on macOS with one native Python environment for each architecture. Each
+environment must contain the requirements in `python/requirements-build.txt`,
+and each FFmpeg binary must match its architecture:
+
+```sh
+export CAPDIO_PYTHON_X64=/path/to/x64/.venv/bin/python
+export CAPDIO_PYTHON_ARM64=/path/to/arm64/.venv/bin/python
+export CAPDIO_FFMPEG_X64=/path/to/x64/ffmpeg
+export CAPDIO_FFMPEG_ARM64=/path/to/arm64/ffmpeg
+export CAPDIO_FFMPEG_LICENSE=/path/to/ffmpeg-static.LICENSE
+export CAPDIO_PYTHON=$CAPDIO_PYTHON_ARM64
+npm run dist:mac
+```
+
+The command creates a universal `Capdio.dmg` in `release/`. Both native
+transcribers and FFmpeg binaries are included; the app selects the matching
+one at runtime. Build the two environments using native Node/Python processes
+or under Rosetta for x64 so Torch and cx_Freeze produce the correct binaries.
 
 Installed projects are stored in Electron's user-data directory rather than
 the installation folder, so imported media and captions remain writable.

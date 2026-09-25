@@ -151,6 +151,7 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .side-nav__name { min-width: 0; flex: 1; transform: translateY(-1px); display: inline-block; color: #9bacc2; font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .side-nav__item.is-selected > .side-nav__name { color: #eff5ff; }
 .side-nav__transcription-progress { flex: none; width: 24px; height: 24px; line-height: 24px; text-align: center; justify-content: center; border-radius: 50%; color: #c9caff; background: radial-gradient(circle, #172338 57%, transparent 59%), conic-gradient(#8b8cff var(--progress), rgba(148, 163, 184, .2) 0); font-size: 8px; font-weight: 800; }
+.side-nav__extraction-progress { color: #78d4c4; background: radial-gradient(circle, #172338 57%, transparent 59%), conic-gradient(#78d4c4 var(--progress), rgba(148, 163, 184, .2) 0); }
 .side-nav__transcription-queued { flex: none; color: #9ba8bb; font-size: 10px; font-weight: 700; }
 .side-nav__caption-check { width: 17px; height: 14px; flex: none; color: #5ee1aa; stroke-width: 3; margin-left: auto; }
 .side-nav__media-icon { display: inline-flex; width: 16px; height: 16px; align-items: center; justify-content: center; color: #aebcf2; }
@@ -276,15 +277,17 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .app-frame:not(.app-frame--dark) .side-nav__media-icon--audio { color: #168173; }
 .app-frame:not(.app-frame--dark) .side-nav__caption-check { color: #16835c; }
 .app-frame:not(.app-frame--dark) .side-nav__transcription-progress { color: #4338a0; background: radial-gradient(circle, #f1f4fa 57%, transparent 59%), conic-gradient(#6366d9 var(--progress), #d5ddea 0); }
+.app-frame:not(.app-frame--dark) .side-nav__extraction-progress { color: #168173; background: radial-gradient(circle, #f1f4fa 57%, transparent 59%), conic-gradient(#168173 var(--progress), #d5ddea 0); }
 .app-frame:not(.app-frame--dark) .side-nav__items { scrollbar-color: #a8b4c8 transparent; }
 .app-frame:not(.app-frame--dark) .side-nav__items::-webkit-scrollbar-thumb { background: #a8b4c8; }
 .app-frame:not(.app-frame--dark) .context-menu button { color: #334155; }
-.app-frame:not(.app-frame--dark) .context-menu button:hover:not(:disabled) { background: #eceeff; }
+.app-frame:not(.app-frame--dark) .context-menu button:hover:not(:disabled, .context-menu__delete) { background: #eceeff; }
 .app-frame:not(.app-frame--dark) .context-menu .context-menu__delete { color: #b42332; }
 .app-frame:not(.app-frame--dark) .context-menu .context-menu__delete:hover { color: white; background: #c7373d; }
 .app-frame:not(.app-frame--dark) :is(.name-dialog p, .upload-dialog > p, .upload-dialog__queue p) { color: #64748b; }
 .app-frame:not(.app-frame--dark) .name-dialog input { background: #f8faff; border-color: #cbd5e1; }
-.app-frame:not(.app-frame--dark) .name-dialog button:not([type="submit"]):not(.name-dialog__delete) { color: #475569; border-color: #cbd5e1; }
+.app-frame:not(.app-frame--dark) .name-dialog button:not([type="submit"]):not(.name-dialog__delete, .url-download-dialog__cancel) { color: #475569; border-color: #cbd5e1; }
+.app-frame:not(.app-frame--dark) .name-dialog .url-download-dialog__cancel { color: #b42332; border-color: #f0a8ae; background: #fff1f2; }
 .app-frame:not(.app-frame--dark) :is(.upload-dialog code, .upload-dialog__queue div span:last-child) { color: #5148b8; }
 .app-frame:not(.app-frame--dark) :is(.upload-dialog__copy, .upload-dialog__close) { color: #475569; }
 .app-frame:not(.app-frame--dark) :is(.upload-dialog__copy, .upload-dialog__close):hover { background: #e4e9f4; color: #172033; }
