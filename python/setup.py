@@ -12,9 +12,11 @@ setup(
     version="1.0.0",
     options={
         "build_exe": {
-            "packages": ["torch", "whisper", "tiktoken"],
+            "packages": ["torch", "whisper", "tiktoken", "numba", "llvmlite"],
             "includes": [
                 "whisper.transcribe",
+                "numba.core.types.old_scalars",
+                "numba.core.types.new_scalars",
                 "unittest",
                 "unittest.case",
                 "unittest.loader",
@@ -26,7 +28,7 @@ setup(
     executables=[
         Executable(
             os.path.join(os.path.dirname(__file__), "transcribe.py"),
-            target_name="capdio-transcribe.exe",
+            target_name="capdio-transcribe.exe" if sys.platform == "win32" else "capdio-transcribe",
         )
     ],
 )

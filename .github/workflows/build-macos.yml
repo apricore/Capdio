@@ -1,0 +1,138 @@
+name: Build macOS universal DMG
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-transcriber:
+    name: Build ${{ matrix.arch }} transcriber
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+            python: '3.12'
+            torch: '2.2.2'
+          - arch: arm64
+            runner: macos-15
+            python: '3.12'
+            torch: '2.10.0'
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Create Python build environment
+        run: |
+          python -m venv .venv-packaging
+          .venv-packaging/bin/python -m pip install --upgrade pip
+          .venv-packaging/bin/python -m pip install \
+            openai-whisper==20250625 \
+            torch==${{ matrix.torch }} \
+            numba==0.61.0 \
+            llvmlite==0.44.0 \
+            numpy==1.26.4 \
+            cx-Freeze==8.7.0
+
+      - name: Build transcriber
+        run: |
+          .venv-packaging/bin/python python/setup.py build_exe \
+            --build-exe=resources/bin/darwin-${{ matrix.arch }}/capdio-transcribe
+
+      - name: Stage FFmpeg
+        run: |
+          mkdir -p resources/bin/darwin-${{ matrix.arch }}
+          cp node_modules/ffmpeg-static/ffmpeg resources/bin/darwin-${{ matrix.arch }}/ffmpeg
+          chmod 755 resources/bin/darwin-${{ matrix.arch }}/ffmpeg
+
+      - name: Download Whisper model
+        if: matrix.arch == 'arm64'
+        env:
+          CAPDIO_PYTHON: ${{ github.workspace }}/.venv-packaging/bin/python
+        run: node scripts/download-model.js
+
+      - name: Upload architecture resources
+        uses: actions/upload-artifact@v4
+        with:
+          name: capdio-resources-${{ matrix.arch }}
+          path: resources/bin/darwin-${{ matrix.arch }}
+          if-no-files-found: error
+
+      - name: Upload Whisper model
+        if: matrix.arch == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: capdio-model
+          path: resources/models
+          if-no-files-found: error
+
+  package-universal:
+    name: Package universal DMG
+    needs: build-transcriber
+    runs-on: macos-15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Download x64 resources
+        uses: actions/download-artifact@v4
+        with:
+          name: capdio-resources-x64
+          path: resources/bin/darwin-x64
+
+      - name: Download ARM64 resources
+        uses: actions/download-artifact@v4
+        with:
+          name: capdio-resources-arm64
+          path: resources/bin/darwin-arm64
+
+      - name: Download Whisper model
+        uses: actions/download-artifact@v4
+        with:
+          name: capdio-model
+          path: resources/models
+
+      - name: Stage FFmpeg license
+        run: |
+          mkdir -p resources/licenses
+          cp node_modules/ffmpeg-static/ffmpeg.LICENSE resources/licenses/ffmpeg-static.LICENSE
+
+      - name: Build universal DMG
+        run: npm run repackage:mac
+
+      - name: Upload universal DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Capdio-macOS-universal
+          path: release/*.dmg
+          if-no-files-found: error

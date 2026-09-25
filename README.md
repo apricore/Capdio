@@ -2,7 +2,7 @@
 
 Capdio is a desktop audio/video library for listening, reading synchronized captions, and looking up unfamiliar words. It combines local Whisper transcription with an interactive caption book and a reusable Youdao dictionary window.
 
-Built with Electron, React, Vite, OpenAI Whisper, and FFmpeg. The included installer pipeline targets **Windows x64**.
+Built with Electron, React, Vite, OpenAI Whisper, and FFmpeg. The included installer pipelines target **Windows x64** and **macOS universal**.
 
 <p align="center">
   <img src="assets/app-window-screenshot-lighttheme.png" alt="Capdio light theme" width="49%">
@@ -202,6 +202,8 @@ After Python changes, run the full `npm run dist:win` build. See [PACKAGING.md](
 | `npm run package:resources` | Build the transcriber and stage the model |
 | `npm run dist:win` | Build the complete Windows installer |
 | `npm run repackage:win` | Rebuild the renderer and installer using existing runtime resources |
+| `npm run dist:mac` | Build the complete universal macOS DMG |
+| `npm run repackage:mac` | Rebuild the renderer and universal macOS DMG using existing runtime resources |
 
 ## Project structure
 

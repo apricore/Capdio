@@ -42,8 +42,9 @@ if (!hasSingleInstanceLock) {
 const runtimeRoot = app.isPackaged ? process.resourcesPath : __dirname;
 const platformBinaryDirectory = path.join(runtimeRoot, 'bin', `${process.platform}-${process.arch}`);
 const bundledDevelopmentPython = path.join(__dirname, '.venv-packaging', 'Scripts', 'python.exe');
+const defaultDevelopmentPython = process.platform === 'win32' ? 'python' : 'python3';
 const developmentPythonExecutable = process.env.CAPDIO_PYTHON
-    || (fsSync.existsSync(bundledDevelopmentPython) ? bundledDevelopmentPython : 'python');
+    || (fsSync.existsSync(bundledDevelopmentPython) ? bundledDevelopmentPython : defaultDevelopmentPython);
 const ffmpegExecutable = app.isPackaged
     ? path.join(platformBinaryDirectory, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
     : 'ffmpeg';
@@ -698,7 +699,7 @@ ipcMain.handle('run-python-test', async () => {
             'test.py'
         );
 
-        const python = spawn('python', [pythonScript]);
+        const python = spawn(developmentPythonExecutable, [pythonScript]);
 
         let stdout = '';
         let stderr = '';
