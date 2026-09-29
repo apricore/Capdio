@@ -56,6 +56,8 @@ export default function MediaPlayer({
   const mediaRef = useRef(null);
   const activeRef = useRef(null);
   const pausedForBlurRef = useRef(false);
+  const resumeWhenDictionaryHiddenRef = useRef(false);
+  const dictionaryVisibleRef = useRef(false);
   const windowFocusedRef = useRef(true);
   const playInBackgroundRef = useRef(playInBackground);
   playInBackgroundRef.current = playInBackground;
@@ -97,37 +99,59 @@ export default function MediaPlayer({
     const media = mediaRef.current;
     if (!media) return;
     pausedForBlurRef.current = false;
+    resumeWhenDictionaryHiddenRef.current = false;
     const pauseForBlur = () => {
       windowFocusedRef.current = false;
       windowFocusTimeRef.current = -Infinity;
       if (playInBackgroundRef.current) return;
       if (!media.paused && !media.ended) {
+        resumeWhenDictionaryHiddenRef.current = false;
         pausedForBlurRef.current = true;
         media.pause();
       }
     };
-    const resumeAfterBlur = () => {
+    const resumePausedMedia = () => {
+      if (!(pausedForBlurRef.current || resumeWhenDictionaryHiddenRef.current) || !media.paused || media.ended) return;
+      pausedForBlurRef.current = false;
+      resumeWhenDictionaryHiddenRef.current = false;
+      media.play().catch((error) => {
+        if (mediaRef.current !== media) return;
+        pausedForBlurRef.current = false;
+        resumeWhenDictionaryHiddenRef.current = false;
+        setIsPlaying(false);
+        onPlayingChangeRef.current?.(false);
+        console.error('Unable to resume media:', error);
+      });
+    };
+    const resumeAfterBlur = (_event, shouldResume = true) => {
       if (!windowFocusedRef.current) windowFocusTimeRef.current = performance.now();
       windowFocusedRef.current = true;
-      if (pausedForBlurRef.current && media.paused && !media.ended) {
-        media.play().catch((error) => {
-          if (mediaRef.current !== media) return;
-          pausedForBlurRef.current = false;
-          setIsPlaying(false);
-          onPlayingChangeRef.current?.(false);
-          console.error('Unable to resume media:', error);
-        });
+      if (!shouldResume) {
+        if (pausedForBlurRef.current) resumeWhenDictionaryHiddenRef.current = true;
+        pausedForBlurRef.current = false;
+        return;
       }
+      resumePausedMedia();
     };
-    const clearBlurPause = () => { pausedForBlurRef.current = false; };
+    const resumeAfterDictionaryHidden = (_event, visible) => {
+      dictionaryVisibleRef.current = Boolean(visible);
+      if (!visible && windowFocusedRef.current) resumePausedMedia();
+    };
+    const clearBlurPause = () => {
+      pausedForBlurRef.current = false;
+      resumeWhenDictionaryHiddenRef.current = false;
+    };
     ipcRenderer.on('player-window-blurred', pauseForBlur);
     ipcRenderer.on('player-window-focused', resumeAfterBlur);
+    ipcRenderer.on('dictionary-visibility-changed', resumeAfterDictionaryHidden);
     media.addEventListener('emptied', clearBlurPause);
     media.addEventListener('ended', clearBlurPause);
     return () => {
       pausedForBlurRef.current = false;
+      resumeWhenDictionaryHiddenRef.current = false;
       ipcRenderer.removeListener('player-window-blurred', pauseForBlur);
       ipcRenderer.removeListener('player-window-focused', resumeAfterBlur);
+      ipcRenderer.removeListener('dictionary-visibility-changed', resumeAfterDictionaryHidden);
       media.removeEventListener('emptied', clearBlurPause);
       media.removeEventListener('ended', clearBlurPause);
     };
@@ -228,6 +252,7 @@ export default function MediaPlayer({
   }
 
   async function play() {
+    resumeWhenDictionaryHiddenRef.current = false;
     try {
       await mediaRef.current?.play();
     } catch (error) {
@@ -321,6 +346,10 @@ export default function MediaPlayer({
   }
 
   function toggleVideoPlaybackOnClick() {
+    if (dictionaryVisibleRef.current) {
+      videoClickRestoresFocusRef.current = false;
+      return;
+    }
     const restoresFocus = videoClickRestoresFocusRef.current;
     videoClickRestoresFocusRef.current = false;
     if (restoresFocus) {
@@ -332,6 +361,7 @@ export default function MediaPlayer({
   }
 
   function togglePlayback() {
+    resumeWhenDictionaryHiddenRef.current = false;
     if (pausedForBlurRef.current) {
       pausedForBlurRef.current = false;
       mediaRef.current?.pause();

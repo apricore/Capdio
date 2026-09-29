@@ -107,6 +107,21 @@ function toggleDictionaryTheme() {
     setDictionaryTheme(!darkTheme);
     if (lookupSender && !lookupSender.isDestroyed()) lookupSender.send('dictionary-theme-changed', darkTheme);
 }
+function sendDictionaryVisibility(visible) {
+    if (lookupSender && !lookupSender.isDestroyed()) {
+        lookupSender.send('dictionary-visibility-changed', visible);
+    }
+}
+function hideDictionaryAndFocusMain(sender = lookupSender) {
+    const win = youdaoWindow;
+    if (win && !win.isDestroyed()) win.hide();
+    if (!sender || sender.isDestroyed()) return;
+    const mainWindow = BrowserWindow.fromWebContents(sender);
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+}
 
 ipcMain.on('dictionary-control', (event, action) => {
     const win = youdaoWindow;
@@ -115,15 +130,16 @@ ipcMain.on('dictionary-control', (event, action) => {
     if (action === 'back' && history.canGoBack()) history.goBack();
     if (action === 'forward' && history.canGoForward()) history.goForward();
     if (action === 'theme') toggleDictionaryTheme();
-    if (action === 'minimize') win.minimize();
+    if (action === 'minimize') hideDictionaryAndFocusMain();
     if (action === 'maximize') win.isMaximized() ? win.unmaximize() : win.maximize();
-    if (action === 'close') win.close();
+    if (action === 'close') hideDictionaryAndFocusMain();
 });
-async function showDictionary(word, sender, clearHistory = false) {
+async function showDictionary(word, sender, clearHistory = false, showWindow = true) {
     if (sender) lookupSender = sender;
 
     if (!youdaoWindow || youdaoWindow.isDestroyed()) {
         const win = new BrowserWindow({
+            parent: BrowserWindow.fromWebContents(sender),
             width: 1000,
             height: 700,
             show: false,
@@ -133,6 +149,8 @@ async function showDictionary(word, sender, clearHistory = false) {
             webPreferences: { nodeIntegration: true, contextIsolation: false }
         });
         youdaoWindow = win;
+        win.on('show', () => sendDictionaryVisibility(true));
+        win.on('hide', () => sendDictionaryVisibility(false));
         win.setMenu(null);
         win.webContents.on('will-navigate', (event) => event.preventDefault());
         win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -190,7 +208,7 @@ async function showDictionary(word, sender, clearHistory = false) {
             updateNavigation();
             win.webContents.send('dictionary-theme', darkTheme);
         });
-        win.once('ready-to-show', () => win.show());
+        win.once('ready-to-show', () => { if (showWindow) win.show(); });
         const shellReady = win.loadFile(path.join(__dirname, 'dictionary.html'), { query: { theme: darkTheme ? 'dark' : 'light' } });
         // Keep the lifetime tied to Capdio without native child-window stacking.
         const parent = BrowserWindow.fromWebContents(lookupSender);
@@ -231,16 +249,12 @@ async function showDictionary(word, sender, clearHistory = false) {
                 }).catch((error) => console.error('Dictionary lookup failed:', error));
                 return;
             }
-            if (!lookupSender || lookupSender.isDestroyed()) return;
-            const mainWindow = BrowserWindow.fromWebContents(lookupSender);
-            if (!mainWindow || mainWindow.isDestroyed()) return;
-            if (mainWindow.isMinimized()) mainWindow.restore();
-            mainWindow.show();
-            mainWindow.focus();
+            hideDictionaryAndFocusMain();
         };
         contents.on('before-input-event', handleShortcut);
         win.webContents.on('before-input-event', handleShortcut);
         win.on('closed', () => {
+            sendDictionaryVisibility(false);
             if (youdaoWindow === win) {
                 youdaoWindow = null;
                 pageReady = null;
@@ -287,7 +301,7 @@ async function showDictionary(word, sender, clearHistory = false) {
         }
     }
 
-    if (youdaoWindow && !youdaoWindow.isDestroyed()) {
+    if (showWindow && youdaoWindow && !youdaoWindow.isDestroyed()) {
         if (youdaoWindow.isMinimized()) youdaoWindow.restore();
         youdaoWindow.show();
         youdaoWindow.focus();
@@ -301,7 +315,19 @@ function lookup(word, sender, options = {}) {
 }
 
 function openDictionary(sender) {
+    if (youdaoWindow && !youdaoWindow.isDestroyed() && youdaoWindow.isVisible()) {
+        hideDictionaryAndFocusMain(sender);
+        return;
+    }
     return showDictionary(null, sender);
 }
 
-module.exports = { lookup, openDictionary, setDictionaryTheme };
+function isDictionaryVisible() {
+    return Boolean(youdaoWindow && !youdaoWindow.isDestroyed() && youdaoWindow.isVisible());
+}
+
+function initializeDictionary(sender) {
+    return showDictionary(null, sender, false, false);
+}
+
+module.exports = { lookup, openDictionary, initializeDictionary, setDictionaryTheme, isDictionaryVisible };

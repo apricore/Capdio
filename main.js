@@ -10,7 +10,7 @@ const http = require('node:http');
 const os = require('node:os');
 const Busboy = require('busboy');
 const QRCode = require('qrcode');
-const { lookup, openDictionary, setDictionaryTheme } = require('./dictionary');
+const { lookup, openDictionary, initializeDictionary, setDictionaryTheme, isDictionaryVisible } = require('./dictionary');
 
 // Register before the app is ready so Chromium treats capdio as a first-class,
 // secure URL scheme. This is required for media elements to issue range requests.
@@ -187,7 +187,7 @@ function createWindow() {
         win.loadURL('http://localhost:5173');
     }
     win.once('ready-to-show', () => win.show());
-    win.on('focus', () => win.webContents.send('player-window-focused'));
+    win.on('focus', () => win.webContents.send('player-window-focused', !isDictionaryVisible()));
     win.on('blur', () => win.webContents.send('player-window-blurred'));
     win.on('close', (event) => {
         if (win.__capdioCloseAllowed) return;
@@ -195,6 +195,7 @@ function createWindow() {
         win.webContents.send('save-before-close');
         setTimeout(() => { if (!win.isDestroyed()) { win.__capdioCloseAllowed = true; win.close(); } }, 1200);
     });
+    return win;
 }
 
 ipcMain.handle('window-minimize', (event) => {
@@ -1624,7 +1625,8 @@ app.whenReady().then(async () => {
         fs.mkdir(captionDirectory, { recursive: true }),
         clearUrlDownloadStaging()
     ]);
-    createWindow();
+    const mainWindow = createWindow();
+    initializeDictionary(mainWindow.webContents);
 });
 
 let shutdownCleanupStarted = false;
